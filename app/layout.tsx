@@ -6,7 +6,8 @@ const FAVICON =
 
 export const metadata: Metadata = {
   title: "stacks — ask your documents",
-  description: "A small RAG tool on Cloudflare Workers AI and Vectorize: ingest documents, ask questions, get cited answers.",
+  description:
+    "A managed RAG tool on Cloudflare AI Search: ingest documents in any language, ask questions in any language, get cited answers grounded only in what you've uploaded.",
   icons: { icon: FAVICON },
 };
 

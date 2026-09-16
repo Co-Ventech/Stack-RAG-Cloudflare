@@ -18,21 +18,40 @@
   "kv_namespaces": [
     {
       "binding": "VINEXT_KV_CACHE",
-      "id": "83c4915444a245599d83d93b1322d3ea"
-    },
-    {
-      "binding": "DOCS_KV",
-      "id": "b9a475115e144001abc47bdf6c5dc953"
+      // Replace with your own KV namespace id (`npx wrangler kv namespace create VINEXT_KV_CACHE`) —
+      // see README "Use your own Cloudflare account". Left as an obvious placeholder on purpose so a
+      // missed edit fails loudly instead of silently pointing at someone else's namespace.
+      "id": "<YOUR_KV_NAMESPACE_ID>"
     }
   ],
   "ai": {
-    "binding": "AI"
+    "binding": "AI",
+    "remote": true
   },
-  "vectorize": [
+  "r2_buckets": [
     {
-      "binding": "VECTORIZE",
-      "index_name": "cf-rag-tool-index",
+      "binding": "DOCS_BUCKET",
+      "bucket_name": "cf-rag-tool-docs",
       "remote": true
     }
-  ]
+  ],
+  "ai_search": [
+    {
+      "binding": "AI_SEARCH",
+      "instance_name": "cf-rag-tool",
+      "remote": true
+    }
+  ],
+  // CF_ACCOUNT_ID and AI_SEARCH_INSTANCE_NAME are plain (non-secret) config —
+  // needed to call the AI Search REST API directly for on-demand indexing
+  // triggers, since the Workers binding doesn't implement jobs.create() at
+  // runtime. AI_SEARCH_INSTANCE_NAME must match ai_search[0].instance_name
+  // above. The actual credential (CF_API_TOKEN) is a secret — see README
+  // "Automatic indexing" for setup. Without it, auto-triggering degrades
+  // gracefully (uploads still work; indexing falls back to the instance's
+  // own scheduled sync, see sync_interval below).
+  "vars": {
+    "CF_ACCOUNT_ID": "<YOUR_CF_ACCOUNT_ID>",
+    "AI_SEARCH_INSTANCE_NAME": "cf-rag-tool"
+  }
 }

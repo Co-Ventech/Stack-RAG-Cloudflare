@@ -1,5 +1,18 @@
 @import "tailwindcss";
-@import url("https://fonts.googleapis.com/css2?family=Lora:ital,wght@0,500;0,600;0,700;1,500&family=Work+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap");
+/* Font-loading tradeoff: this app is language-universal, so in principle
+   every major script family (Arabic, Hebrew, CJK, Devanagari, Thai, …)
+   deserves a dedicated web font. Loading all of those would be a lot of
+   render-blocking weight for the common case of a single script per
+   session. Compromise: we ship one additional family, Noto Naskh Arabic,
+   which covers the RTL scripts most likely to show up next to Latin text
+   in a document-Q&A tool (Arabic, and — because it shares the Arabic
+   block — Urdu, Persian, Pashto, Sindhi, Kurdish). Everything else (CJK,
+   Devanagari, Hebrew, Thai, Cyrillic, etc.) falls back to the reader's own
+   system font stack below, which on any modern OS already ships solid
+   glyph coverage for those scripts — it just won't match this app's
+   chosen display/body typefaces exactly. That's an acceptable tradeoff for
+   a lightweight page over hand-picking and loading a dozen web fonts. */
+@import url("https://fonts.googleapis.com/css2?family=Lora:ital,wght@0,500;0,600;0,700;1,500&family=Work+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&family=Noto+Naskh+Arabic:wght@400;500;600&display=swap");
 
 :root {
   color-scheme: light;
@@ -11,11 +24,21 @@
   --border: #e4d9c3;
   --border-strong: #cdbb96;
   --accent: #3f6b4f;
+  --accent-2: #a8763e;
   --accent-ink: #f6f1e7;
   --err: #a23e3e;
+  /* System fallback stacks below include fonts that ship with common OSes
+     for scripts we don't load a web font for (Hebrew, CJK, Devanagari,
+     Thai, Cyrillic, …), so those still render with real script-appropriate
+     glyphs — just via whatever the reader's device already has. */
   --font-display: "Lora", ui-serif, Georgia, serif;
   --font-body: "Work Sans", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+  /* Arabic-script text (Arabic, Urdu, Persian, Pashto, Sindhi, Kurdish, …)
+     gets a dedicated web font since it's the RTL script most likely to
+     appear in this app's documents; other RTL scripts (Hebrew, Thaana,
+     Syriac) fall back to the system RTL-capable fonts on the next line. */
+  --font-rtl: "Noto Naskh Arabic", "Geeza Pro", "Al Bayan", "Times New Roman", serif;
 }
 
 * {
@@ -76,4 +99,159 @@ a {
   50% {
     opacity: 1;
   }
+}
+
+/* RTL script text (Arabic, Urdu, Persian, Hebrew, …): script-appropriate
+   font and roomier line-height — Arabic-script diagonal stress in
+   particular needs more vertical breathing room than Latin text does.
+   Applied via dir="auto" + this class so mixed-script content still
+   renders each script correctly. rtl-text is for larger/quoted passages
+   (answers, source excerpts); rtl-text-ui is for compact UI-sized text
+   (inputs, chips) where the extra line-height would look cramped/uneven. */
+.rtl-text {
+  font-family: var(--font-rtl);
+  line-height: 2.1;
+  font-size: 1.05em;
+}
+
+.rtl-text-ui {
+  font-family: var(--font-rtl);
+}
+
+[dir="rtl"] {
+  text-align: right;
+}
+
+.status-dot {
+  animation: status-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes status-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(63, 107, 79, 0.35);
+  }
+  50% {
+    box-shadow: 0 0 0 4px rgba(63, 107, 79, 0);
+  }
+}
+
+::selection {
+  background: rgba(63, 107, 79, 0.18);
+}
+
+/* Rendered Markdown for answer bodies. The model's replies routinely
+   include bold, lists, and GFM pipe tables, so this styles the output of
+   react-markdown + remark-gfm rather than leaving it as an unstyled blob. */
+.markdown-body {
+  font-size: 0.875rem;
+  line-height: 1.7;
+}
+
+.markdown-body > :first-child {
+  margin-top: 0;
+}
+
+.markdown-body > :last-child {
+  margin-bottom: 0;
+}
+
+.markdown-body p,
+.markdown-body ul,
+.markdown-body ol,
+.markdown-body blockquote {
+  margin: 0.6em 0;
+}
+
+.markdown-body ul,
+.markdown-body ol {
+  padding-inline-start: 1.4em;
+}
+
+.markdown-body li {
+  margin: 0.25em 0;
+}
+
+.markdown-body h1,
+.markdown-body h2,
+.markdown-body h3,
+.markdown-body h4 {
+  font-family: var(--font-display);
+  font-weight: 600;
+  line-height: 1.3;
+  margin: 0.9em 0 0.4em;
+}
+
+.markdown-body h1 {
+  font-size: 1.25em;
+}
+.markdown-body h2 {
+  font-size: 1.15em;
+}
+.markdown-body h3,
+.markdown-body h4 {
+  font-size: 1.05em;
+}
+
+.markdown-body strong {
+  font-weight: 700;
+}
+
+.markdown-body code {
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  background: var(--bg-2);
+  border-radius: 0.25em;
+  padding: 0.1em 0.35em;
+}
+
+.markdown-body pre {
+  background: var(--bg-2);
+  border-radius: 0.5em;
+  padding: 0.75em 1em;
+  overflow-x: auto;
+}
+
+.markdown-body pre code {
+  background: none;
+  padding: 0;
+}
+
+.markdown-body blockquote {
+  border-inline-start: 3px solid var(--border-strong);
+  padding-inline-start: 0.9em;
+  color: var(--ink-dim);
+}
+
+.markdown-body a {
+  text-decoration: underline;
+  text-decoration-color: var(--border-strong);
+  text-underline-offset: 2px;
+}
+
+/* Tables: wrapped in an overflow-x:auto scroller so a wide table (or one
+   in a language that renders wider, e.g. tall Arabic-script ligatures)
+   scrolls inside the card instead of breaking the page's own layout. */
+.markdown-table-wrap {
+  overflow-x: auto;
+  margin: 0.6em 0;
+}
+
+.markdown-body table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.95em;
+}
+
+.markdown-body th,
+.markdown-body td {
+  border: 1px solid var(--border-strong);
+  padding: 0.4em 0.7em;
+  text-align: inherit;
+  vertical-align: top;
+}
+
+.markdown-body th {
+  background: var(--bg-2);
+  font-weight: 600;
 }

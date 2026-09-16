@@ -1,15 +1,22 @@
 import { env } from "cloudflare:workers";
+import { getRequestExecutionContext } from "vinext/shims/request-context";
 import { getClientIp } from "@/lib/clientinfo";
 import { checkRateLimit } from "@/lib/ratelimit";
-import { EMBEDDING_MODEL, MAX_DOC_CHARS, chunkText, docVectorId } from "@/lib/rag";
-import { docKey, type DocMeta } from "@/lib/docs";
+import {
+  isAllowedExtension,
+  sanitizeFilename,
+  titleToKey,
+  MAX_FILE_BYTES,
+  MAX_PASTE_CHARS,
+  ALLOWED_EXTENSIONS,
+} from "@/lib/docs";
+import { triggerIndexingJob, ensureFastSyncInterval, getPendingRemovals } from "@/lib/aisearch";
 
 const INGEST_RATE_LIMIT = { limit: 20, windowSeconds: 86400 };
-const EMBED_BATCH_SIZE = 50;
 
 export async function POST(request: Request) {
   const ip = getClientIp(request);
-  const rate = await checkRateLimit(env.DOCS_KV, `ingest:${ip}`, INGEST_RATE_LIMIT);
+  const rate = await checkRateLimit(env.VINEXT_KV_CACHE, `ingest:${ip}`, INGEST_RATE_LIMIT);
   if (!rate.allowed) {
     return Response.json(
       { error: `Rate limit exceeded. Try again in ${rate.resetSeconds}s.` },
@@ -17,64 +24,91 @@ export async function POST(request: Request) {
     );
   }
 
-  const body = (await request.json().catch(() => null)) as { title?: string; text?: string } | null;
-  const title = body?.title?.trim();
-  const text = body?.text?.trim();
-
-  if (!title || !text) {
-    return Response.json({ error: "Both a title and document text are required." }, { status: 400 });
-  }
-  if (text.length > MAX_DOC_CHARS) {
-    return Response.json({ error: `Document is too large (max ${MAX_DOC_CHARS} characters).` }, { status: 413 });
+  const formData = await request.formData().catch(() => null);
+  if (!formData) {
+    return Response.json({ error: "Expected multipart form data." }, { status: 400 });
   }
 
-  const chunks = chunkText(text);
-  if (chunks.length === 0) {
-    return Response.json({ error: "Couldn't extract any text to index." }, { status: 400 });
+  const file = formData.get("file");
+  const title = formData.get("title")?.toString().trim();
+  const text = formData.get("text")?.toString().trim();
+
+  let key: string;
+  let body: ArrayBuffer | string;
+  let contentType: string;
+
+  if (file instanceof Blob && file.size > 0) {
+    const filename = "name" in file ? (file as File).name : "upload";
+    if (!isAllowedExtension(filename)) {
+      return Response.json(
+        { error: `Unsupported file type. Allowed: ${ALLOWED_EXTENSIONS.join(", ")}` },
+        { status: 400 },
+      );
+    }
+    if (file.size > MAX_FILE_BYTES) {
+      return Response.json({ error: "File is too large (max 20MB)." }, { status: 413 });
+    }
+    key = sanitizeFilename(filename);
+    body = await file.arrayBuffer();
+    contentType = file.type || "application/octet-stream";
+  } else if (title && text) {
+    if (text.length > MAX_PASTE_CHARS) {
+      return Response.json({ error: `Text is too long (max ${MAX_PASTE_CHARS} characters).` }, { status: 413 });
+    }
+    key = titleToKey(title);
+    body = text;
+    contentType = "text/plain; charset=utf-8";
+  } else {
+    return Response.json({ error: "Provide either a file or a title + text." }, { status: 400 });
   }
 
-  const docId = crypto.randomUUID();
-  const vectors: { id: string; values: number[]; metadata: Record<string, string | number> }[] = [];
-
-  for (let i = 0; i < chunks.length; i += EMBED_BATCH_SIZE) {
-    const batch = chunks.slice(i, i + EMBED_BATCH_SIZE);
-    const embedded = (await env.AI.run(EMBEDDING_MODEL, { text: batch })) as { data: number[][] };
-    embedded.data.forEach((values, j) => {
-      const chunkIndex = i + j;
-      vectors.push({
-        id: docVectorId(docId, chunkIndex),
-        values,
-        metadata: { docId, title, chunkIndex, text: batch[j] },
-      });
-    });
+  // Avoid clobbering an existing object with the same name.
+  const existing = await env.DOCS_BUCKET.head(key);
+  if (existing) {
+    const dot = key.lastIndexOf(".");
+    const stem = dot === -1 ? key : key.slice(0, dot);
+    const ext = dot === -1 ? "" : key.slice(dot);
+    key = `${stem}-${crypto.randomUUID().slice(0, 8)}${ext}`;
   }
 
-  await env.VECTORIZE.upsert(vectors);
+  await env.DOCS_BUCKET.put(key, body, { httpMetadata: { contentType } });
 
-  const meta: DocMeta = {
-    id: docId,
-    title,
-    createdAt: new Date().toISOString(),
-    chunkCount: chunks.length,
-    vectorIds: vectors.map((v) => v.id),
-  };
-  await env.DOCS_KV.put(docKey(docId), JSON.stringify(meta));
+  // Best-effort, non-blocking: try to make the new upload searchable right
+  // away (needs CF_API_TOKEN — see lib/aisearch.ts) and make sure the
+  // instance's own scheduled sync is as fast as AI Search allows even when
+  // it isn't. Neither call can fail this request — both swallow their own
+  // errors — so this is scheduled via waitUntil rather than awaited.
+  const ctx = getRequestExecutionContext();
+  const background = Promise.all([
+    triggerIndexingJob(env).catch(() => undefined),
+    ensureFastSyncInterval(env).catch(() => undefined),
+  ]);
+  if (ctx) {
+    ctx.waitUntil(background);
+  } else {
+    await background;
+  }
 
-  return Response.json({ id: docId, title, chunkCount: chunks.length });
+  return Response.json({ key, status: "uploaded", note: "AI Search will index this shortly." });
 }
 
+/**
+ * Lists R2 objects — the document *library* — plus, separately, any
+ * filenames that were deleted from R2 but aren't yet confirmed removed
+ * from AI Search's index (see lib/aisearch.ts "Pending removals"). These
+ * are two different things: R2 is the source of truth for what's in the
+ * library; AI Search's index (which answers questions) can lag behind it
+ * by up to one sync. Returning both lets the UI say so honestly instead of
+ * presenting the R2 listing as "what's indexed."
+ */
 export async function GET() {
-  const list = await env.DOCS_KV.list({ prefix: "doc:" });
-  const docs = await Promise.all(
-    list.keys.map(async (k) => {
-      const raw = await env.DOCS_KV.get(k.name);
-      return raw ? (JSON.parse(raw) as DocMeta) : null;
-    }),
-  );
-  const sorted = docs
-    .filter((d): d is DocMeta => d !== null)
-    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-    .map(({ id, title, createdAt, chunkCount }) => ({ id, title, createdAt, chunkCount }));
+  const list = await env.DOCS_BUCKET.list();
+  const docs = list.objects
+    .map((obj) => ({ key: obj.key, size: obj.size, uploaded: obj.uploaded.toISOString() }))
+    .sort((a, b) => b.uploaded.localeCompare(a.uploaded));
 
-  return Response.json({ docs: sorted });
+  const stats = await env.AI_SEARCH.stats().catch(() => null);
+  const pendingRemovals = await getPendingRemovals(env, stats?.last_activity);
+
+  return Response.json({ docs, pendingRemovals });
 }
