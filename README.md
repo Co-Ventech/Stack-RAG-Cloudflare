@@ -14,7 +14,11 @@ npx wrangler login
 npm run dev          # http://127.0.0.1:3000
 ```
 
-`wrangler.jsonc` already points at this account's resources: the KV namespace, the R2 bucket `cf-rag-tool-docs` and the AI Search instance `cf-rag-tool`. For a different account, create your own and replace those values.
+Before you run it, set up your own resources and update `wrangler.jsonc`:
+
+- A KV namespace (`npx wrangler kv namespace create`): replace `<YOUR_KV_NAMESPACE_ID>`.
+- Your account id: replace `<YOUR_CF_ACCOUNT_ID>`.
+- An R2 bucket named `cf-rag-tool-docs` and an AI Search instance named `cf-rag-tool` using that bucket (or use your own names and update the config to match).
 
 The app talks to the real Cloudflare services even when run locally (`remote: true`), so usage is billed to your account.
 
