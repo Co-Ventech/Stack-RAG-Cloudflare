@@ -1,10 +1,11 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { Components } from "react-markdown";
 import { isRtl } from "@/lib/rtl";
+import { ALLOWED_EXTENSIONS, extensionOf, maxBytesFor, formatMiB } from "@/lib/docs";
 
 interface DocSummary {
   key: string;
@@ -17,6 +18,7 @@ interface Source {
   score?: number;
   count: number;
   removed: boolean;
+  excerpt?: string;
 }
 
 interface IndexStats {
@@ -32,10 +34,151 @@ interface IndexStats {
   };
 }
 
+interface Exchange {
+  id: number;
+  question: string;
+  status: "loading" | "done" | "error";
+  startedAt: number;
+  answer?: string;
+  sources?: Source[];
+  scopedTo?: string[];
+  error?: string;
+}
+
+type Threads = Record<string, Exchange[]>;
+
+const ALL_DOCS = "all";
+const STORAGE_KEY = "stacks-conversations-v1";
+const MAX_SAVED_PER_SCOPE = 30;
+const HISTORY_EXCHANGES = 6; // earlier Q&A pairs sent along as context
+const CLIENT_TIMEOUT_MS = 75_000;
+
+// The headline cycles through languages: the product's whole point is that you
+// can ask in one language about documents written in another.
+const HEADLINES: { text: string; dir: "ltr" | "rtl"; lang: string }[] = [
+  { text: "Ask your documents.", dir: "ltr", lang: "en" },
+  { text: "اپنی دستاویزات سے پوچھیں۔", dir: "rtl", lang: "ur" },
+  { text: "向你的文档提问。", dir: "ltr", lang: "zh" },
+  { text: "Pregunta a tus documentos.", dir: "ltr", lang: "es" },
+  { text: "اسأل مستنداتك.", dir: "rtl", lang: "ar" },
+  { text: "अपने दस्तावेज़ों से पूछें।", dir: "ltr", lang: "hi" },
+  { text: "Interrogez vos documents.", dir: "ltr", lang: "fr" },
+  { text: "Belgelerine sor.", dir: "ltr", lang: "tr" },
+];
+
+const GENERAL_QUESTIONS = [
+  "Summarize the main points",
+  "What topics does this cover?",
+  "List the key names, dates or numbers mentioned",
+];
+
+const DOCUMENT_QUESTIONS = [
+  "Give me a short summary of this document",
+  "What are the key points?",
+  "Which names, dates or numbers matter most?",
+  "What questions does this document leave unanswered?",
+];
+
+// Response bodies are untrusted: a proxy or crash page can return HTML, and
+// the strict DOM typings make res.json() `unknown`. This reads JSON safely
+// and yields {} (never throws) so callers can fall back to a clean message.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function readJson(res: Response): Promise<any> {
+  try {
+    return await res.json();
+  } catch {
+    return {};
+  }
+}
+
+// Starts an indexing job through the dev server's local helper (see
+// vite.config.ts). Returns "started", "cooldown" (a job ran in the last 30s),
+// or "unavailable" (deployed copy, or wrangler not logged in).
+// When a run is already in progress (or ran within 30s) a new file isn't part
+// of it, so try again a few times instead of making the user press Sync now.
+async function startLocalSyncWithRetry(
+  onResult: (outcome: "started" | "cooldown" | "busy" | "unavailable") => void,
+  attempts = 6,
+  delayMs = 40_000,
+): Promise<void> {
+  for (let i = 0; i < attempts; i++) {
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    const outcome = await startLocalSync();
+    if (outcome === "started" || outcome === "unavailable") {
+      onResult(outcome);
+      return;
+    }
+  }
+  onResult("cooldown");
+}
+
+async function startLocalSync(): Promise<"started" | "cooldown" | "busy" | "unavailable"> {
+  try {
+    const res = await fetch("/__local/sync", { method: "POST", headers: { "x-requested-with": "stacks" } });
+    if (!res.ok) return "unavailable";
+    const data = await readJson(res);
+    if (data.ok) return "started";
+    if (data.reason === "cooldown") return "cooldown";
+    if (data.reason === "busy") return "busy";
+    return "unavailable";
+  } catch {
+    return "unavailable";
+  }
+}
+
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function scopeKeyOf(selected: string[]): string {
+  return selected.length === 0 ? ALL_DOCS : [...selected].sort().join("\u0001");
+}
+
+function docUrl(key: string): string {
+  return `/api/docs/${encodeURIComponent(key)}`;
+}
+
+function loadSavedThreads(): Threads {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as Threads;
+    const out: Threads = {};
+    for (const [k, list] of Object.entries(parsed ?? {})) {
+      if (!Array.isArray(list)) continue;
+      out[k] = list.map((x) =>
+        // A question that was still running when the page closed can't finish.
+        x.status === "loading" ? { ...x, status: "error", error: "This question was interrupted. Try again." } : x,
+      );
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function saveThreads(threads: Threads): void {
+  try {
+    const trimmed: Threads = {};
+    for (const [k, list] of Object.entries(threads)) {
+      if (list.length > 0) trimmed[k] = list.slice(-MAX_SAVED_PER_SCOPE);
+    }
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(trimmed));
+  } catch {
+    /* storage full or blocked: conversations just won't persist */
+  }
+}
+
+function downloadText(filename: string, body: string, type = "text/markdown;charset=utf-8") {
+  const blob = new Blob([body], { type });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
 // Markdown table cells need to scroll rather than blow out the card's
@@ -43,17 +186,72 @@ function formatBytes(bytes: number): string {
 // HTML is ever rendered (no rehype-raw) — model output is untrusted text,
 // so literal HTML like stray "<br>" tags shows up as visible text instead
 // of being executed.
+//
+// Models often write "<br>" for a line break (especially inside table cells).
+// Since raw HTML is never rendered, that used to appear as literal "<br>" text.
+// These components turn only that exact token into a real <br /> element that
+// we create ourselves, so nothing from the model is ever parsed as HTML.
+function withBreaks(children: React.ReactNode): React.ReactNode {
+  const nodes = Array.isArray(children) ? children : [children];
+  return nodes.map((child, i) => {
+    if (typeof child !== "string") return child;
+    const parts = child.split(/<br\s*\/?>/gi);
+    if (parts.length === 1) return child;
+    return parts.map((part, j) => (
+      <span key={`${i}-${j}`}>
+        {j > 0 ? <br /> : null}
+        {part}
+      </span>
+    ));
+  });
+}
+
 const markdownComponents: Components = {
   table: ({ children }) => (
     <div className="markdown-table-wrap">
       <table>{children}</table>
     </div>
   ),
+  p: ({ children }) => <p>{withBreaks(children)}</p>,
+  li: ({ children }) => <li>{withBreaks(children)}</li>,
+  td: ({ children }) => <td>{withBreaks(children)}</td>,
+  th: ({ children }) => <th>{withBreaks(children)}</th>,
 };
+
+function RotatingHeadline() {
+  const [index, setIndex] = useState(0);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    const id = setInterval(() => setIndex((i) => (i + 1) % HEADLINES.length), 3400);
+    return () => clearInterval(id);
+  }, []);
+
+  const current = HEADLINES[index];
+  return (
+    <>
+      <h1 className="sr-only">Ask your documents</h1>
+      <p key={current.lang} aria-hidden dir={current.dir} lang={current.lang} className="headline headline-swap">
+        {current.text}
+      </p>
+    </>
+  );
+}
+
+function Elapsed({ since }: { since: number }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
+  return <>{Math.max(0, Math.floor((now - since) / 1000))}s</>;
+}
 
 export default function HomePage() {
   const [docs, setDocs] = useState<DocSummary[] | null>(null);
   const [pendingRemovals, setPendingRemovals] = useState<string[]>([]);
+  const [docFilter, setDocFilter] = useState("");
   const [mode, setMode] = useState<"file" | "paste">("file");
   const [title, setTitle] = useState("");
   const [text, setText] = useState("");
@@ -62,12 +260,16 @@ export default function HomePage() {
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [uploadNote, setUploadNote] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const composerRef = useRef<HTMLTextAreaElement | null>(null);
 
   const [question, setQuestion] = useState("");
-  const [asking, setAsking] = useState(false);
-  const [askError, setAskError] = useState<string | null>(null);
-  const [answer, setAnswer] = useState<string | null>(null);
-  const [sources, setSources] = useState<Source[]>([]);
+  const [threads, setThreads] = useState<Threads>({});
+  const [threadsLoaded, setThreadsLoaded] = useState(false);
+  const nextId = useRef(1);
+  const bottomRef = useRef<HTMLDivElement | null>(null);
+  const controllers = useRef(new Map<number, { controller: AbortController; stoppedByUser: boolean }>());
+  const [openPassages, setOpenPassages] = useState<Record<string, boolean>>({});
+  const [copiedId, setCopiedId] = useState<number | null>(null);
 
   const [stats, setStats] = useState<IndexStats | null>(null);
   const [statsError, setStatsError] = useState(false);
@@ -76,19 +278,35 @@ export default function HomePage() {
   const [syncNote, setSyncNote] = useState<string | null>(null);
 
   const [selectedDocs, setSelectedDocs] = useState<string[]>([]);
-  const [scopedAnswerTo, setScopedAnswerTo] = useState<string[]>([]);
+  const [libraryError, setLibraryError] = useState<string | null>(null);
+
+  const [ocr, setOcr] = useState<boolean | null>(null);
+  const [ocrBusy, setOcrBusy] = useState(false);
+  const [ocrNote, setOcrNote] = useState<string | null>(null);
+
+  const scopeKey = scopeKeyOf(selectedDocs);
+  const thread = threads[scopeKey] ?? [];
+
+  // ---------- data loading ----------
 
   const loadDocs = useCallback(async () => {
-    const res = await fetch("/api/docs");
-    const data = await res.json();
-    setDocs(data.docs ?? []);
-    setPendingRemovals(data.pendingRemovals ?? []);
+    try {
+      const res = await fetch("/api/docs");
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await readJson(res);
+      setDocs(data.docs ?? []);
+      setPendingRemovals(data.pendingRemovals ?? []);
+      setLibraryError(null);
+    } catch {
+      // Keep whatever list we already had; only flag the failure.
+      setLibraryError("Couldn't load the document library.");
+    }
   }, []);
 
   const loadStats = useCallback(async () => {
     try {
       const res = await fetch("/api/sync");
-      const data = await res.json();
+      const data = await readJson(res);
       if (data.ok) {
         setStats(data.stats);
         setStatsError(false);
@@ -100,47 +318,131 @@ export default function HomePage() {
     }
   }, []);
 
+  const loadSettings = useCallback(async () => {
+    try {
+      const res = await fetch("/api/settings");
+      const data = await readJson(res);
+      if (data.ok) setOcr(typeof data.ocr === "boolean" ? data.ocr : null);
+    } catch {
+      /* the switch just stays unavailable */
+    }
+  }, []);
+
   useEffect(() => {
     loadDocs();
     loadStats();
+    loadSettings();
     const id = setInterval(loadStats, 20_000);
     return () => clearInterval(id);
-  }, [loadDocs, loadStats]);
+  }, [loadDocs, loadStats, loadSettings]);
 
-  async function uploadFile(file: File) {
+  // Conversations survive a refresh. Loaded after mount (not during render) so
+  // the server-rendered HTML and the first client render always match.
+  useEffect(() => {
+    const saved = loadSavedThreads();
+    setThreads(saved);
+    const maxId = Math.max(0, ...Object.values(saved).flat().map((x) => x.id));
+    nextId.current = maxId + 1;
+    setThreadsLoaded(true);
+  }, []);
+
+  useEffect(() => {
+    if (threadsLoaded) saveThreads(threads);
+  }, [threads, threadsLoaded]);
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [thread.length, thread[thread.length - 1]?.status]);
+
+  // Drop selections for documents that no longer exist.
+  useEffect(() => {
+    if (!docs) return;
+    const known = new Set(docs.map((d) => d.key));
+    setSelectedDocs((prev) => (prev.every((k) => known.has(k)) ? prev : prev.filter((k) => known.has(k))));
+  }, [docs]);
+
+  // ---------- uploads ----------
+
+  // Uploads one or several files in order. A multi-file drop used to keep
+  // only the first file and silently ignore the rest.
+  async function uploadFiles(files: File[]) {
+    if (files.length === 0 || uploading) return;
     setUploadError(null);
     setUploadNote(null);
     setUploading(true);
+    const saved: string[] = [];
+    const failed: string[] = [];
     try {
-      const formData = new FormData();
-      formData.append("file", file);
-      const res = await fetch("/api/docs", { method: "POST", body: formData });
-      const data = await res.json();
-      if (!res.ok) {
-        setUploadError(data.error ?? "Something went wrong.");
-        return;
+      for (const file of files) {
+        // Check the type and size here too, so a doomed upload fails instantly
+        // instead of after sending megabytes. (The server checks again.)
+        if (!ALLOWED_EXTENSIONS.includes(extensionOf(file.name))) {
+          failed.push(`${file.name}: this file type isn't supported`);
+          continue;
+        }
+        const limit = maxBytesFor(file.name, ocr === true);
+        if (file.size > limit) {
+          failed.push(
+            `${file.name}: too large (max ${formatMiB(limit)} for this file type${
+              extensionOf(file.name) === "pdf" && ocr !== true ? "; turn on OCR to allow PDFs up to 10 MB" : ""
+            })`,
+          );
+          continue;
+        }
+        try {
+          const formData = new FormData();
+          formData.append("file", file);
+          const res = await fetch("/api/docs", { method: "POST", body: formData });
+          const data = await readJson(res);
+          if (!res.ok) {
+            failed.push(`${file.name}: ${data.error ?? `upload failed (HTTP ${res.status})`}`);
+            if (res.status === 429) break; // rate-limited — the rest would fail too
+            continue;
+          }
+          saved.push(data.key);
+        } catch {
+          failed.push(`${file.name}: couldn't reach the server`);
+        }
       }
-      setUploadNote(`Uploaded "${data.key}". Indexing was triggered automatically — it'll be searchable shortly.`);
-      await loadDocs();
-      loadStats();
-    } catch {
-      setUploadError("Couldn't reach the server.");
+      if (saved.length > 0) {
+        const what = saved.length === 1 ? `"${saved[0]}"` : `${saved.length} documents`;
+        await loadDocs();
+        const outcome = await startLocalSync();
+        setUploadNote(
+          outcome === "started"
+            ? `Added ${what}. Indexing started, which usually takes a minute or two.`
+            : outcome === "cooldown" || outcome === "busy"
+              ? `Added ${what}. An indexing run is already going, so this one will start automatically as soon as it can.`
+              : `Added ${what}. It becomes searchable after the next index run.`,
+        );
+        loadStats();
+        if (outcome === "cooldown" || outcome === "busy") {
+          void startLocalSyncWithRetry((o) => {
+            setUploadNote(
+              o === "started"
+                ? `Indexing of ${what} has started, which usually takes a minute or two.`
+                : `Couldn't start indexing ${what} automatically. Press Sync now to try again.`,
+            );
+            loadStats();
+          });
+        }
+      }
+      if (failed.length > 0) setUploadError(failed.join(" · "));
     } finally {
       setUploading(false);
     }
   }
 
   function handleFilePicked(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
-    if (file) uploadFile(file);
+    const files = Array.from(e.target.files ?? []);
     e.target.value = "";
+    void uploadFiles(files);
   }
 
   function handleDrop(e: React.DragEvent) {
     e.preventDefault();
     setDragOver(false);
-    const file = e.dataTransfer.files?.[0];
-    if (file) uploadFile(file);
+    void uploadFiles(Array.from(e.dataTransfer.files ?? []));
   }
 
   async function handlePasteSubmit(e: React.FormEvent) {
@@ -153,16 +455,33 @@ export default function HomePage() {
       formData.append("title", title);
       formData.append("text", text);
       const res = await fetch("/api/docs", { method: "POST", body: formData });
-      const data = await res.json();
+      const data = await readJson(res);
       if (!res.ok) {
-        setUploadError(data.error ?? "Something went wrong.");
+        setUploadError(data.error ?? `Something went wrong (HTTP ${res.status}).`);
         return;
       }
-      setUploadNote(`Saved "${data.key}". Indexing was triggered automatically — it'll be searchable shortly.`);
       setTitle("");
       setText("");
       await loadDocs();
+      const outcome = await startLocalSync();
+      setUploadNote(
+        outcome === "started"
+          ? `Saved "${data.key}". Indexing started, which usually takes a minute or two.`
+          : outcome === "cooldown" || outcome === "busy"
+            ? `Saved "${data.key}". An indexing run is already going, so this one will start automatically as soon as it can.`
+            : `Saved "${data.key}". It becomes searchable after the next index run.`,
+      );
       loadStats();
+      if (outcome === "cooldown" || outcome === "busy") {
+        void startLocalSyncWithRetry((o) => {
+          setUploadNote(
+            o === "started"
+              ? `Indexing of "${data.key}" has started, which usually takes a minute or two.`
+              : `Couldn't start indexing "${data.key}" automatically. Press Sync now to try again.`,
+          );
+          loadStats();
+        });
+      }
     } catch {
       setUploadError("Couldn't reach the server.");
     } finally {
@@ -171,9 +490,21 @@ export default function HomePage() {
   }
 
   async function handleDelete(key: string) {
+    if (!window.confirm(`Remove "${key}" from the library? This can't be undone.`)) return;
+    const previousDocs = docs;
+    const previousSelection = selectedDocs;
     setDocs((prev) => prev?.filter((d) => d.key !== key) ?? null);
     setSelectedDocs((prev) => prev.filter((k) => k !== key));
-    await fetch(`/api/docs/${encodeURIComponent(key)}`, { method: "DELETE" });
+    try {
+      const res = await fetch(docUrl(key), { method: "DELETE" });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    } catch {
+      // Put the row back instead of letting it silently reappear later.
+      setDocs(previousDocs);
+      setSelectedDocs(previousSelection);
+      setLibraryError(`Couldn't remove "${key}". Please try again.`);
+      return;
+    }
     // Removing the R2 object doesn't remove its vectors from the index
     // until the next sync — reload so the "pending removal" state (and its
     // sync-now nudge) shows up right away instead of only on the next poll.
@@ -181,53 +512,205 @@ export default function HomePage() {
     loadStats();
   }
 
+  async function toggleOcr(next: boolean) {
+    if (ocrBusy) return;
+    const ok = window.confirm(
+      next
+        ? "Turn on OCR?\n\nThis reads text from scanned PDFs and images. AI Search will re-index every document, which takes a few minutes and is billed as ingestion. Answers may be slower or incomplete until it finishes."
+        : "Turn off OCR?\n\nScanned PDFs and images will stop being read as text. AI Search will re-index every document.",
+    );
+    if (!ok) return;
+    setOcrBusy(true);
+    setOcrNote(null);
+    try {
+      const res = await fetch("/api/settings", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ocr: next }),
+      });
+      const data = await readJson(res);
+      if (!res.ok || !data.ok) {
+        setOcrNote(data.error ?? `Couldn't change OCR (HTTP ${res.status}).`);
+        return;
+      }
+      setOcr(data.ocr);
+      setOcrNote(
+        data.changed
+          ? "OCR is now " + (data.ocr ? "on" : "off") + ". AI Search is re-indexing your documents."
+          : "OCR was already " + (data.ocr ? "on" : "off") + ".",
+      );
+      loadStats();
+    } catch {
+      setOcrNote("Couldn't reach the server.");
+    } finally {
+      setOcrBusy(false);
+    }
+  }
+
+  // ---------- scope ----------
+
   function toggleDocSelected(key: string) {
     setSelectedDocs((prev) => (prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key]));
   }
 
-  async function handleAsk(e: React.FormEvent) {
-    e.preventDefault();
-    setAskError(null);
-    setAnswer(null);
-    setSources([]);
-    setScopedAnswerTo([]);
-    setAsking(true);
+  function chatWithDoc(key: string) {
+    setSelectedDocs([key]);
+    setQuestion("");
+    setTimeout(() => composerRef.current?.focus(), 0);
+  }
+
+  // ---------- asking ----------
+
+  const updateExchange = useCallback((scope: string, id: number, patch: Partial<Exchange>) => {
+    setThreads((prev) => ({
+      ...prev,
+      [scope]: (prev[scope] ?? []).map((x) => (x.id === id ? { ...x, ...patch } : x)),
+    }));
+  }, []);
+
+  // Runs one question for the given scope. `replaceId` re-runs an existing
+  // exchange (retry / regenerate) instead of adding a new one.
+  async function runQuestion(q: string, scope: string, files: string[], replaceId?: number) {
+    const existing = threads[scope] ?? [];
+    const upTo = replaceId === undefined ? existing : existing.slice(0, existing.findIndex((x) => x.id === replaceId));
+    const history = upTo
+      .filter((x) => x.status === "done" && x.answer)
+      .slice(-HISTORY_EXCHANGES)
+      .flatMap((x) => [
+        { role: "user" as const, content: x.question },
+        { role: "assistant" as const, content: x.answer as string },
+      ]);
+
+    const id = replaceId ?? nextId.current++;
+    const fresh: Exchange = { id, question: q, status: "loading", startedAt: Date.now() };
+    setThreads((prev) => {
+      const list = prev[scope] ?? [];
+      return {
+        ...prev,
+        [scope]: replaceId === undefined ? [...list, fresh] : list.map((x) => (x.id === id ? fresh : x)),
+      };
+    });
+
+    const entry = { controller: new AbortController(), stoppedByUser: false };
+    controllers.current.set(id, entry);
+    const timer = setTimeout(() => entry.controller.abort(), CLIENT_TIMEOUT_MS);
     try {
       const res = await fetch("/api/ask", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ question, filenames: selectedDocs }),
+        body: JSON.stringify({ question: q, filenames: files, history }),
+        signal: entry.controller.signal,
       });
-      const data = await res.json();
+      const data = await readJson(res);
       if (!res.ok) {
-        setAskError(data.error ?? "Something went wrong.");
+        updateExchange(scope, id, {
+          status: "error",
+          error: data.error ?? `Something went wrong (HTTP ${res.status}).`,
+        });
         return;
       }
-      setAnswer(data.answer);
-      setSources(data.sources ?? []);
-      setScopedAnswerTo(data.scopedTo ?? []);
+      updateExchange(scope, id, {
+        status: "done",
+        answer: data.answer,
+        sources: data.sources ?? [],
+        scopedTo: data.scopedTo ?? [],
+        error: undefined,
+      });
     } catch {
-      setAskError("Couldn't reach the server.");
+      updateExchange(scope, id, {
+        status: "error",
+        error: entry.stoppedByUser
+          ? "Stopped."
+          : entry.controller.signal.aborted
+            ? "This is taking too long. Cloudflare AI Search may be slow right now. Try again."
+            : "Couldn't reach the server.",
+      });
     } finally {
-      setAsking(false);
+      clearTimeout(timer);
+      controllers.current.delete(id);
     }
   }
+
+  function handleAsk(e: React.FormEvent) {
+    e.preventDefault();
+    const q = question.trim();
+    if (!q || asking) return;
+    setQuestion("");
+    void runQuestion(q, scopeKey, selectedDocs);
+  }
+
+  function stopExchange(id: number) {
+    const entry = controllers.current.get(id);
+    if (entry) {
+      entry.stoppedByUser = true;
+      entry.controller.abort();
+    }
+  }
+
+  function retryExchange(x: Exchange) {
+    void runQuestion(x.question, scopeKey, selectedDocs, x.id);
+  }
+
+  async function copyAnswer(x: Exchange) {
+    try {
+      await navigator.clipboard.writeText(x.answer ?? "");
+      setCopiedId(x.id);
+      setTimeout(() => setCopiedId((cur) => (cur === x.id ? null : cur)), 1600);
+    } catch {
+      /* clipboard unavailable (insecure context or denied) */
+    }
+  }
+
+  function clearConversation() {
+    if (thread.length > 0 && !window.confirm("Clear this conversation?")) return;
+    setThreads((prev) => ({ ...prev, [scopeKey]: [] }));
+  }
+
+  function exportConversation() {
+    const scopeName = selectedDocs.length === 0 ? "all documents" : selectedDocs.join(", ");
+    const lines = [`# Conversation about ${scopeName}`, ""];
+    for (const x of thread) {
+      lines.push(`## ${x.question}`, "");
+      if (x.status === "done") {
+        lines.push(x.answer ?? "", "");
+        if (x.sources && x.sources.length > 0) {
+          lines.push("Sources:", ...x.sources.map((s, i) => `${i + 1}. ${s.key}${s.removed ? " (removed)" : ""}`), "");
+        }
+      } else if (x.status === "error") {
+        lines.push(`(No answer: ${x.error ?? "failed"})`, "");
+      }
+    }
+    downloadText(`stacks-conversation-${new Date().toISOString().slice(0, 10)}.md`, lines.join("\n"));
+  }
+
+  // ---------- indexing ----------
 
   async function handleSyncNow() {
     setSyncing(true);
     setSyncNote(null);
     try {
       const res = await fetch("/api/sync", { method: "POST" });
-      const data = await res.json();
+      const data = await readJson(res);
       if (data.ok) {
         setSyncNote("Indexing job started.");
       } else if (data.reason === "no-token") {
-        setSyncNote("No API token configured — showing the CLI command instead.");
-        setShowSyncHelp(true);
+        const outcome = await startLocalSync();
+        if (outcome === "started") {
+          setSyncNote("Indexing started. It usually takes a minute or two.");
+        } else if (outcome === "cooldown" || outcome === "busy") {
+          setSyncNote("An indexing run just happened or is still going. Try again in about 30 seconds.");
+        } else {
+          setSyncNote("Instant indexing needs an API token. Until then new files are picked up on the 15-minute schedule.");
+          setShowSyncHelp(true);
+        }
       } else if (data.reason === "already-active") {
         setSyncNote("An indexing job is already running.");
       } else if (data.reason === "debounced") {
         setSyncNote("A sync was just triggered — try again in a bit.");
+      } else if (data.reason === "rate-limited") {
+        setSyncNote("Cloudflare allows one sync every 30 seconds — try again shortly.");
+      } else if (data.reason === "error") {
+        setSyncNote(data.detail ? `Sync failed: ${data.detail}` : "Sync failed. Please try again.");
       } else if (data.error) {
         setSyncNote(data.error);
       } else {
@@ -241,41 +724,40 @@ export default function HomePage() {
     }
   }
 
+  // ---------- derived ----------
+
   const pending = (stats?.queued ?? 0) + (stats?.running ?? 0);
-  const answerIsRtl = answer ? isRtl(answer) : false;
+  const asking = thread.some((x) => x.status === "loading");
   const questionIsRtl = isRtl(question);
+  const hasDocs = !!docs && docs.length > 0;
+  const scoped = selectedDocs.length > 0;
+  const singleDoc = selectedDocs.length === 1 ? selectedDocs[0] : null;
+  const scopeLabel = singleDoc ?? (scoped ? `${selectedDocs.length} documents` : "all documents");
+
+  const visibleDocs = useMemo(() => {
+    if (!docs) return null;
+    const f = docFilter.trim().toLowerCase();
+    return f ? docs.filter((d) => d.key.toLowerCase().includes(f)) : docs;
+  }, [docs, docFilter]);
+
+  const exampleQuestions = scoped ? DOCUMENT_QUESTIONS : GENERAL_QUESTIONS;
 
   return (
-    <main className="relative z-10 mx-auto flex min-h-screen max-w-6xl flex-col gap-10 px-6 py-12 sm:py-16">
-      <header className="flex flex-col gap-6 border-b border-[var(--border)] pb-8 sm:flex-row sm:items-end sm:justify-between">
-        <div>
-          <div className="flex items-center gap-3">
-            <span
-              aria-hidden
-              className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-[var(--accent)] text-[var(--accent-ink)]"
-            >
-              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2">
-                <path
-                  d="M6 4h9l4 4v12a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1Z"
-                  strokeLinejoin="round"
-                />
-                <path d="M15 4v4h4" strokeLinejoin="round" />
-                <circle cx="10.5" cy="14" r="3" />
-                <path d="M12.8 16.3 15 18.5" strokeLinecap="round" />
-              </svg>
-            </span>
-            <p className="chip tracking-[0.2em] text-[var(--accent)] uppercase">cloudflare ai search</p>
-          </div>
-          <h1 className="mt-4 font-[family-name:var(--font-display)] text-4xl font-semibold tracking-tight sm:text-5xl">
-            Ask your documents.
-          </h1>
-          <p className="mt-3 max-w-lg text-sm leading-relaxed text-[var(--ink-dim)]">
-            Drop in PDFs, Word docs, or plain text in any language — Cloudflare AI Search indexes
-            them with a multilingual model. Ask in any language and get answers grounded only in
-            what you&rsquo;ve uploaded, with citations, replied to in the language you asked in.
-          </p>
+    <div className="shell">
+      {/* ---------- Library rail ---------- */}
+      <aside className="rail" aria-label="Document library">
+        <div className="brand">
+          <span className="brand-mark" aria-hidden>
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M6 4h9l4 4v12a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1Z" strokeLinejoin="round" />
+              <path d="M8.5 13h7M8.5 17h4" strokeLinecap="round" />
+            </svg>
+          </span>
+          <span className="brand-name">stacks</span>
         </div>
+
         <IndexStatusCard
+          docCount={docs ? docs.length : null}
           stats={stats}
           error={statsError}
           pending={pending}
@@ -284,322 +766,530 @@ export default function HomePage() {
           syncing={syncing}
           syncNote={syncNote}
         />
-      </header>
 
-      <div className="grid gap-10 lg:grid-cols-[1.6fr_1fr] lg:items-start">
-        <section className="flex flex-col gap-10">
-          <div>
-            <h2 className="font-[family-name:var(--font-display)] text-xl font-semibold">Ask a question</h2>
-
-            <div
-              className={`mt-3 flex flex-wrap items-center gap-2 rounded-lg px-3 py-2 text-sm transition-colors ${
-                selectedDocs.length > 0
-                  ? "border border-[var(--accent)] bg-[var(--bg-2)]"
-                  : "border border-transparent"
-              }`}
-            >
-              <span className="font-medium text-[var(--ink-dim)]">Asking:</span>
-              {selectedDocs.length === 0 ? (
-                <span className="chip rounded-full border border-[var(--border-strong)] px-2.5 py-1 text-[var(--ink-dim)]">
-                  all documents
-                </span>
-              ) : (
-                <>
-                  {selectedDocs.map((key) => (
-                    <span
-                      key={key}
-                      dir="auto"
-                      className="chip flex max-w-[16rem] items-center gap-1.5 rounded-full border border-[var(--accent)] bg-[var(--paper)] px-2.5 py-1 text-[var(--accent)]"
-                    >
-                      <span className="truncate">{key}</span>
-                      <button
-                        type="button"
-                        onClick={() => toggleDocSelected(key)}
-                        aria-label={`Remove ${key} from scope`}
-                        className="shrink-0 hover:opacity-70"
-                      >
-                        ×
-                      </button>
-                    </span>
-                  ))}
-                  <button
-                    type="button"
-                    onClick={() => setSelectedDocs([])}
-                    className="chip rounded-full border border-[var(--border-strong)] px-2.5 py-1 text-[var(--ink-dim)] hover:border-[var(--accent)] hover:text-[var(--accent)]"
-                  >
-                    reset to all documents
-                  </button>
-                </>
-              )}
-            </div>
-
-            <form onSubmit={handleAsk} className="mt-3 flex flex-col gap-3">
-              <textarea
-                required
-                dir="auto"
-                value={question}
-                onChange={(e) => setQuestion(e.target.value)}
-                placeholder="What does the document say about…? (ask in any language)"
-                rows={2}
-                className={`paper resize-none rounded-lg px-4 py-3 text-sm text-[var(--ink)] placeholder:text-[var(--ink-dim)] focus:border-[var(--accent)] focus:outline-none ${
-                  selectedDocs.length > 0 ? "border-[var(--accent)]" : ""
-                } ${questionIsRtl ? "rtl-text-ui" : ""}`}
-              />
-              <button
-                type="submit"
-                disabled={asking}
-                className="self-start rounded-lg bg-[var(--accent)] px-5 py-2.5 text-sm font-medium text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-50"
-              >
-                {asking
-                  ? "thinking…"
-                  : selectedDocs.length > 0
-                    ? `ask (${selectedDocs.length} doc${selectedDocs.length === 1 ? "" : "s"} only) →`
-                    : "ask →"}
-              </button>
-            </form>
-
-            {askError ? <p className="fade-in-up mt-3 text-sm text-[var(--err)]">{askError}</p> : null}
-
-            {answer ? (
-              <div className="fade-in-up paper mt-5 rounded-xl p-5">
-                <div
-                  dir="auto"
-                  className={`markdown-body ${answerIsRtl ? "rtl-text" : ""}`}
-                >
-                  <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
-                    {answer}
-                  </ReactMarkdown>
-                </div>
-                {sources.length > 0 ? (
-                  <div className="mt-4 border-t border-[var(--border)] pt-4">
-                    {scopedAnswerTo.length > 0 ? (
-                      <p className="chip mb-2 text-[var(--ink-dim)]">
-                        Answered using only: {scopedAnswerTo.join(", ")}
-                      </p>
-                    ) : null}
-                    <div className="flex flex-wrap gap-2">
-                      {sources.map((s, i) => {
-                        const titleParts = [
-                          s.score !== undefined ? `relevance ${s.score.toFixed(2)}` : null,
-                          `${s.count} matching excerpt${s.count === 1 ? "" : "s"}`,
-                          s.removed
-                            ? "This document was removed from the library but the search index hasn't caught up yet."
-                            : null,
-                        ].filter(Boolean);
-                        return (
-                          <span
-                            key={s.key}
-                            dir="auto"
-                            className={`chip flex items-center gap-1.5 rounded-full border px-2.5 py-1 ${
-                              s.removed
-                                ? "border-[var(--err)]/60 text-[var(--err)]"
-                                : "border-[var(--border-strong)] text-[var(--ink-dim)]"
-                            }`}
-                            title={titleParts.join(" · ")}
-                          >
-                            <span>
-                              [{i + 1}] {s.key}
-                              {s.count > 1 ? ` · ${s.count} excerpts` : ""}
-                            </span>
-                            {s.removed ? <span className="font-medium">removed</span> : null}
-                          </span>
-                        );
-                      })}
-                    </div>
-                  </div>
-                ) : null}
-              </div>
-            ) : null}
-          </div>
-
-          <div>
-            <h2 className="font-[family-name:var(--font-display)] text-xl font-semibold">Add a document</h2>
-
-            <div className="mt-4 flex gap-2">
-              <button
-                type="button"
-                onClick={() => setMode("file")}
-                className={`chip rounded-full border px-3 py-1.5 transition-colors ${
-                  mode === "file"
-                    ? "border-[var(--accent)] text-[var(--accent)]"
-                    : "border-[var(--border-strong)] text-[var(--ink-dim)]"
-                }`}
-              >
-                upload file
-              </button>
-              <button
-                type="button"
-                onClick={() => setMode("paste")}
-                className={`chip rounded-full border px-3 py-1.5 transition-colors ${
-                  mode === "paste"
-                    ? "border-[var(--accent)] text-[var(--accent)]"
-                    : "border-[var(--border-strong)] text-[var(--ink-dim)]"
-                }`}
-              >
-                paste text
-              </button>
-            </div>
-
-            {mode === "file" ? (
-              <div
-                onDragOver={(e) => {
-                  e.preventDefault();
-                  setDragOver(true);
-                }}
-                onDragLeave={() => setDragOver(false)}
-                onDrop={handleDrop}
-                onClick={() => fileInputRef.current?.click()}
-                className={`paper mt-4 flex cursor-pointer flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed px-6 py-12 text-center transition-colors ${
-                  dragOver ? "border-[var(--accent)] bg-[var(--bg-2)]" : "border-[var(--border-strong)]"
-                }`}
-              >
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept=".pdf,.docx,.odt,.md,.txt"
-                  onChange={handleFilePicked}
-                  className="hidden"
-                />
-                <p className="text-sm font-medium">
-                  {uploading ? "uploading…" : "Drop a file here, or click to browse"}
-                </p>
-                <p className="chip text-[var(--ink-dim)]">PDF, DOCX, ODT, Markdown, or plain text — up to 20MB</p>
-              </div>
-            ) : (
-              <form onSubmit={handlePasteSubmit} className="mt-4 flex flex-col gap-3">
-                <input
-                  type="text"
-                  required
-                  dir="auto"
-                  value={title}
-                  onChange={(e) => setTitle(e.target.value)}
-                  placeholder="Document title"
-                  className={`paper rounded-lg px-4 py-2.5 text-sm text-[var(--ink)] placeholder:text-[var(--ink-dim)] focus:border-[var(--accent)] focus:outline-none ${
-                    isRtl(title) ? "rtl-text-ui" : ""
-                  }`}
-                />
-                <textarea
-                  required
-                  dir="auto"
-                  value={text}
-                  onChange={(e) => setText(e.target.value)}
-                  placeholder="Paste the document's text here…"
-                  rows={6}
-                  className={`paper resize-y rounded-lg px-4 py-3 text-sm text-[var(--ink)] placeholder:font-[family-name:var(--font-body)] placeholder:text-[var(--ink-dim)] focus:border-[var(--accent)] focus:outline-none ${
-                    isRtl(text) ? "rtl-text" : "font-[family-name:var(--font-mono)]"
-                  }`}
-                />
-                <button
-                  type="submit"
-                  disabled={uploading}
-                  className="self-start rounded-lg border border-[var(--border-strong)] bg-[var(--paper)] px-5 py-2.5 text-sm font-medium transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:opacity-50"
-                >
-                  {uploading ? "saving…" : "save document"}
+        <section aria-labelledby="library-heading">
+          <div className="flex items-baseline justify-between gap-2">
+            <h2 id="library-heading" className="rail-heading">
+              Your documents
+            </h2>
+            {hasDocs ? (
+              <span className="flex gap-3">
+                <button type="button" className="rail-link" onClick={() => setSelectedDocs(docs!.map((d) => d.key))}>
+                  Select all
                 </button>
-              </form>
-            )}
-
-            {uploadError ? <p className="fade-in-up mt-3 text-sm text-[var(--err)]">{uploadError}</p> : null}
-            {uploadNote ? (
-              <div className="fade-in-up mt-3 flex flex-wrap items-center gap-2 text-sm text-[var(--accent)]">
-                <span>{uploadNote}</span>
                 <button
                   type="button"
-                  onClick={() => setShowSyncHelp(true)}
-                  className="chip rounded-full border border-[var(--accent)] px-2 py-0.5 text-[var(--accent)] hover:opacity-80"
+                  className="rail-link"
+                  onClick={() => setSelectedDocs([])}
+                  disabled={!scoped}
                 >
-                  how do I sync?
+                  Clear
                 </button>
-              </div>
+              </span>
             ) : null}
           </div>
-        </section>
-
-        <section>
-          <div className="flex items-center justify-between gap-2">
-            <h2 className="font-[family-name:var(--font-display)] text-xl font-semibold">Document library</h2>
-            {docs && docs.length > 0 ? (
-              <p className="chip text-[var(--ink-dim)]">check to scope questions</p>
-            ) : null}
-          </div>
-          <p className="mt-1 text-xs leading-relaxed text-[var(--ink-dim)]">
-            What&rsquo;s in R2, not necessarily what&rsquo;s searchable right now — the search
-            index can lag behind by a sync or more. See Index status.
+          <p className="rail-note mt-1">
+            Click a name to chat with just that file, or tick several to ask across them.
           </p>
 
-          {pendingRemovals.length > 0 ? (
-            <div className="fade-in-up mt-3 rounded-lg border border-[var(--accent-2)] bg-[var(--bg-2)] px-4 py-3 text-sm">
-              <p>
-                <span className="font-medium">
-                  Index likely out of sync — {pendingRemovals.length} removed document
-                  {pendingRemovals.length === 1 ? " may" : "s may"} still be searchable.
-                </span>{" "}
-                Deleted from the library but not yet confirmed dropped from the search index:{" "}
-                <span dir="auto">{pendingRemovals.join(", ")}</span>. Usually clears within a
-                sync or two (as often as every 15 minutes), or use &ldquo;sync now&rdquo; above.
-                Either way, any citation from a removed document is always flagged
-                &ldquo;removed&rdquo; below the answer, live — so nothing is hidden even after
-                this notice clears.
-              </p>
+          {docs && docs.length > 4 ? (
+            <input
+              type="search"
+              className="field mt-3"
+              placeholder="Filter documents"
+              aria-label="Filter documents"
+              value={docFilter}
+              onChange={(e) => setDocFilter(e.target.value)}
+            />
+          ) : null}
+
+          {libraryError ? (
+            <div role="alert" className="rail-error">
+              <span>{libraryError}</span>
+              <button type="button" className="rail-link" onClick={() => void loadDocs()}>
+                Retry
+              </button>
             </div>
           ) : null}
 
-          <div className="paper mt-4 divide-y divide-[var(--border)] rounded-xl">
-            {docs === null ? (
-              <p className="px-5 py-6 text-sm text-[var(--ink-dim)]">
-                <span className="spin-dot mr-2 inline-block h-1.5 w-1.5 rounded-full bg-[var(--accent)]" />
-                loading…
-              </p>
-            ) : docs.length === 0 ? (
-              <p className="px-5 py-6 text-sm text-[var(--ink-dim)]">No documents yet — add one above.</p>
-            ) : (
-              docs.map((doc) => {
+          {pendingRemovals.length > 0 ? (
+            <div className="rail-notice">
+              <strong>
+                {pendingRemovals.length} removed document{pendingRemovals.length === 1 ? " may" : "s may"} still be
+                searchable.
+              </strong>{" "}
+              <span dir="auto">{pendingRemovals.join(", ")}</span> will drop out after the next sync. Answers that cite
+              them are marked &ldquo;removed&rdquo;.
+            </div>
+          ) : null}
+
+          {visibleDocs === null ? (
+            <p className="rail-note mt-3">{libraryError ? "Library unavailable." : "Loading…"}</p>
+          ) : docs && docs.length === 0 ? (
+            <p className="rail-note mt-3">No documents yet. Add one below to start asking questions.</p>
+          ) : visibleDocs.length === 0 ? (
+            <p className="rail-note mt-3">No document matches &ldquo;{docFilter}&rdquo;.</p>
+          ) : (
+            <ul className="doc-list">
+              {visibleDocs.map((doc) => {
                 const checked = selectedDocs.includes(doc.key);
                 return (
-                  <div
-                    key={doc.key}
-                    className={`flex items-center justify-between gap-4 px-5 py-3.5 transition-colors ${
-                      checked ? "bg-[var(--bg-2)]" : ""
-                    }`}
-                  >
-                    <label className="flex min-w-0 items-center gap-3">
-                      <input
-                        type="checkbox"
-                        checked={checked}
-                        onChange={() => toggleDocSelected(doc.key)}
-                        aria-label={`Scope questions to ${doc.key} only`}
-                        className="shrink-0 accent-[var(--accent)]"
-                      />
-                      <div className="min-w-0">
-                        <p dir="auto" className="truncate text-sm font-medium">
-                          {doc.key}
-                        </p>
-                        <p className="chip mt-0.5 text-[var(--ink-dim)]">
-                          {formatBytes(doc.size)} · {new Date(doc.uploaded).toLocaleDateString()}
-                        </p>
-                      </div>
-                    </label>
+                  <li key={doc.key} className="doc-row" data-on={checked}>
+                    <input
+                      type="checkbox"
+                      className="doc-check"
+                      checked={checked}
+                      onChange={() => toggleDocSelected(doc.key)}
+                      aria-label={`Include ${doc.key} in questions`}
+                    />
                     <button
                       type="button"
-                      onClick={() => handleDelete(doc.key)}
-                      className="shrink-0 rounded-full border border-[var(--border-strong)] px-3 py-1.5 text-xs transition-colors hover:border-[var(--err)] hover:text-[var(--err)]"
+                      className="doc-main"
+                      onClick={() => chatWithDoc(doc.key)}
+                      title={`Chat with ${doc.key}`}
                     >
-                      remove
+                      <span dir="auto" className="doc-name">
+                        {doc.key}
+                      </span>
+                      <span className="doc-meta">
+                        {formatBytes(doc.size)} &middot; {new Date(doc.uploaded).toLocaleDateString()}
+                      </span>
                     </button>
-                  </div>
+                    <a
+                      className="icon-btn"
+                      href={docUrl(doc.key)}
+                      target="_blank"
+                      rel="noreferrer"
+                      aria-label={`Open ${doc.key}`}
+                      title="Open file"
+                    >
+                      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2">
+                        <path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5" strokeLinecap="round" strokeLinejoin="round" />
+                      </svg>
+                    </a>
+                    <button
+                      type="button"
+                      className="icon-btn danger"
+                      onClick={() => handleDelete(doc.key)}
+                      aria-label={`Remove ${doc.key}`}
+                      title="Remove"
+                    >
+                      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2">
+                        <path d="M4 7h16M10 11v6M14 11v6M6 7l1 12a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-12M9 7V4h6v3" strokeLinecap="round" strokeLinejoin="round" />
+                      </svg>
+                    </button>
+                  </li>
                 );
-              })
-            )}
-          </div>
+              })}
+            </ul>
+          )}
         </section>
-      </div>
+
+        <section aria-labelledby="add-heading">
+          <h2 id="add-heading" className="rail-heading">
+            Add a document
+          </h2>
+          <div className="seg" role="group" aria-label="How to add a document">
+            <button type="button" aria-pressed={mode === "file"} onClick={() => setMode("file")}>
+              Upload file
+            </button>
+            <button type="button" aria-pressed={mode === "paste"} onClick={() => setMode("paste")}>
+              Paste text
+            </button>
+          </div>
+
+          {mode === "file" ? (
+            <div
+              className="dropzone"
+              data-over={dragOver}
+              onDragOver={(e) => {
+                e.preventDefault();
+                setDragOver(true);
+              }}
+              onDragLeave={() => setDragOver(false)}
+              onDrop={handleDrop}
+              onClick={() => fileInputRef.current?.click()}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  fileInputRef.current?.click();
+                }
+              }}
+              role="button"
+              tabIndex={0}
+              aria-label="Upload documents: drop files here or press Enter to browse"
+            >
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".pdf,.docx,.odt,.md,.txt,.jpg,.jpeg,.png,.webp,.gif,.bmp,.tif,.tiff,.heic,.heif"
+                multiple
+                onChange={handleFilePicked}
+                className="hidden"
+              />
+              <p className="text-sm font-medium">{uploading ? "Uploading…" : "Drop files here, or click to browse"}</p>
+              <p className="rail-note mt-1">
+                PDF, Word, text, Markdown or images. Up to 10 MB for text{ocr ? " and PDFs" : ""}, 4 MB for the rest.
+              </p>
+            </div>
+          ) : (
+            <form onSubmit={handlePasteSubmit} className="mt-3 flex flex-col gap-2">
+              <input
+                type="text"
+                required
+                dir="auto"
+                value={title}
+                onChange={(e) => setTitle(e.target.value)}
+                placeholder="Document title"
+                className={`field ${isRtl(title) ? "rtl-text-ui" : ""}`}
+              />
+              <textarea
+                required
+                dir="auto"
+                value={text}
+                onChange={(e) => setText(e.target.value)}
+                placeholder="Paste the text here"
+                rows={6}
+                className={`field resize-y ${isRtl(text) ? "rtl-text-ui" : ""}`}
+              />
+              <button type="submit" disabled={uploading} className="btn-marker self-start">
+                {uploading ? "Saving…" : "Save document"}
+              </button>
+            </form>
+          )}
+
+          {uploadError ? (
+            <p role="alert" className="rail-error">
+              {uploadError}
+            </p>
+          ) : null}
+          {uploadNote ? (
+            <p className="rail-note mt-3">
+              {uploadNote}{" "}
+              <button type="button" className="rail-link" onClick={() => setShowSyncHelp(true)}>
+                How do I index it now?
+              </button>
+            </p>
+          ) : null}
+        </section>
+
+        <section aria-labelledby="ocr-heading">
+          <h2 id="ocr-heading" className="rail-heading">
+            Scanned files
+          </h2>
+          <label className="switch-row">
+            <input
+              type="checkbox"
+              className="switch"
+              role="switch"
+              checked={ocr === true}
+              disabled={ocr === null || ocrBusy}
+              onChange={(e) => void toggleOcr(e.target.checked)}
+            />
+            <span>
+              Read text from scanned PDFs and images (OCR)
+              <span className="rail-note" style={{ display: "block" }}>
+                {ocr === null
+                  ? "Checking…"
+                  : ocr
+                    ? "On. Scanned pages and pictures become searchable. PDFs can be up to 10 MB."
+                    : "Off. Scanned pages and pictures with text won't be searchable. Turning it on re-indexes everything."}
+              </span>
+            </span>
+          </label>
+          {ocrNote ? <p className="rail-note mt-2">{ocrNote}</p> : null}
+        </section>
+      </aside>
+
+      {/* ---------- Desk ---------- */}
+      <main className="desk">
+        <div className="desk-inner">
+          {scoped ? (
+            <div className="scope-bar">
+              <div className="min-w-0">
+                <p className="scope-bar-title">
+                  Chatting with <strong dir="auto">{scopeLabel}</strong>
+                </p>
+                <p className="scope-bar-note">
+                  {singleDoc
+                    ? "Answers come only from this file."
+                    : `Answers come only from these ${selectedDocs.length} files.`}
+                </p>
+              </div>
+              <div className="flex shrink-0 items-center gap-3">
+                {singleDoc ? (
+                  <a className="btn-quiet" href={docUrl(singleDoc)} target="_blank" rel="noreferrer">
+                    Open file
+                  </a>
+                ) : null}
+                <button type="button" className="btn-quiet" onClick={() => setSelectedDocs([])}>
+                  Ask all documents
+                </button>
+              </div>
+            </div>
+          ) : null}
+
+          {thread.length === 0 ? (
+            <div className="pt-4 sm:pt-8">
+              {scoped ? (
+                <>
+                  <h1 dir="auto" className="headline" style={{ minHeight: 0 }}>
+                    {singleDoc ? `Chat with ${singleDoc}` : `Chat with ${selectedDocs.length} documents`}
+                  </h1>
+                  <p className="lede">
+                    Ask anything about {singleDoc ? "this file" : "these files"}. Follow-up questions remember the
+                    conversation.
+                  </p>
+                </>
+              ) : (
+                <>
+                  <RotatingHeadline />
+                  <p className="lede">
+                    Ask in any language about documents written in any language. Answers come only from what
+                    you&rsquo;ve added, with the source files cited, and arrive in the language you asked in.
+                  </p>
+                </>
+              )}
+              {hasDocs ? (
+                <div className="chip-row" role="group" aria-label="Example questions">
+                  {exampleQuestions.map((q) => (
+                    <button
+                      key={q}
+                      type="button"
+                      className="ghost-chip"
+                      onClick={() => {
+                        setQuestion(q);
+                        composerRef.current?.focus();
+                      }}
+                    >
+                      {q}
+                    </button>
+                  ))}
+                </div>
+              ) : (
+                <p className="lede mt-4">Add a document from the library panel to get started.</p>
+              )}
+            </div>
+          ) : (
+            <div className="thread" aria-live="polite">
+              {thread.map((x, index) => (
+                <article key={x.id}>
+                  <h2 dir="auto" className={`question ${isRtl(x.question) ? "rtl-text-ui" : ""}`}>
+                    {x.question}
+                  </h2>
+
+                  {x.status === "loading" ? (
+                    <div className="sheet loading-sheet">
+                      <p className="dots" role="status" aria-label="Searching your documents">
+                        <span />
+                        <span />
+                        <span />
+                      </p>
+                      <p className="doc-meta" style={{ color: "var(--ink-dim)" }}>
+                        Searching {scoped ? scopeLabel : "your documents"} (<Elapsed since={x.startedAt} />)
+                      </p>
+                      <button type="button" className="btn-quiet" onClick={() => stopExchange(x.id)}>
+                        Stop
+                      </button>
+                    </div>
+                  ) : null}
+
+                  {x.status === "error" ? (
+                    <div className="error-box" role="alert">
+                      <p>{x.error}</p>
+                      <button type="button" className="btn-outline-ink" onClick={() => retryExchange(x)}>
+                        Try again
+                      </button>
+                    </div>
+                  ) : null}
+
+                  {x.status === "done" ? (
+                    <>
+                      {x.scopedTo && x.scopedTo.length > 0 ? (
+                        <p className="scope-note" dir="auto">
+                          Answered using only: {x.scopedTo.join(", ")}
+                        </p>
+                      ) : null}
+                      <div className="sheet">
+                        <div dir="auto" className={`markdown-body ${x.answer && isRtl(x.answer) ? "rtl-text" : ""}`}>
+                          <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+                            {x.answer ?? ""}
+                          </ReactMarkdown>
+                        </div>
+
+                        {x.sources && x.sources.length > 0 ? (
+                          <div className="sources">
+                            <h3>Sources</h3>
+                            {x.sources.map((s, i) => {
+                              const open = !!openPassages[`${x.id}:${s.key}`];
+                              const pct = s.score !== undefined ? Math.round(Math.min(1, Math.max(0, s.score)) * 100) : null;
+                              return (
+                                <div
+                                  key={s.key}
+                                  className="source-row"
+                                  data-removed={s.removed}
+                                  title={
+                                    s.removed
+                                      ? "This document was removed from the library but the search index hasn't caught up yet."
+                                      : undefined
+                                  }
+                                >
+                                  <span className="source-num">{i + 1}</span>
+                                  <div className="min-w-0">
+                                    <p dir="auto" className="doc-name" style={{ color: "var(--ink)" }}>
+                                      {s.removed ? (
+                                        <>
+                                          {s.key} <span style={{ color: "var(--err)" }}>(removed)</span>
+                                        </>
+                                      ) : (
+                                        <a className="src-link" href={docUrl(s.key)} target="_blank" rel="noreferrer">
+                                          {s.key}
+                                        </a>
+                                      )}
+                                    </p>
+                                    {pct !== null ? (
+                                      <div className="meter" role="img" aria-label={`Relevance ${pct} percent`}>
+                                        <span style={{ width: `${pct}%` }} />
+                                      </div>
+                                    ) : null}
+                                  </div>
+                                  <span className="doc-meta" style={{ color: "var(--ink-dim)" }}>
+                                    {s.count} excerpt{s.count === 1 ? "" : "s"}
+                                  </span>
+                                  {s.excerpt ? (
+                                    <div className="source-extra">
+                                      <button
+                                        type="button"
+                                        className="btn-quiet"
+                                        aria-expanded={open}
+                                        onClick={() =>
+                                          setOpenPassages((prev) => ({ ...prev, [`${x.id}:${s.key}`]: !open }))
+                                        }
+                                      >
+                                        {open ? "Hide passage" : "Show passage"}
+                                      </button>
+                                      {open ? (
+                                        <blockquote dir="auto" className="passage">
+                                          {s.excerpt}
+                                        </blockquote>
+                                      ) : null}
+                                    </div>
+                                  ) : null}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        ) : (
+                          <p className="no-sources" role="note">
+                            No passages from your files were found for this question, so this answer isn&rsquo;t based on
+                            them. If you just added the file, it may still be indexing. Check the status card on the left
+                            and ask again when it says the index is up to date.
+                          </p>
+                        )}
+                      </div>
+
+                      <div className="answer-actions">
+                        <button type="button" className="btn-quiet" onClick={() => void copyAnswer(x)}>
+                          {copiedId === x.id ? "Copied" : "Copy answer"}
+                        </button>
+                        {index === thread.length - 1 ? (
+                          <button type="button" className="btn-quiet" onClick={() => retryExchange(x)} disabled={asking}>
+                            Regenerate
+                          </button>
+                        ) : null}
+                      </div>
+                    </>
+                  ) : null}
+                </article>
+              ))}
+              <div ref={bottomRef} />
+            </div>
+          )}
+
+          <div className="flex-1" />
+
+          <div className="composer-wrap">
+            <form onSubmit={handleAsk} className="composer">
+              <div className="mb-2 flex flex-wrap items-center gap-1.5">
+                <span className="rail-note" style={{ color: "var(--ink-dim)" }}>
+                  Asking
+                </span>
+                {selectedDocs.length === 0 ? (
+                  <span className="text-sm font-medium">all documents</span>
+                ) : (
+                  <>
+                    {selectedDocs.map((key) => (
+                      <span key={key} dir="auto" className="marker-chip">
+                        <span className="truncate">{key}</span>
+                        <button
+                          type="button"
+                          onClick={() => toggleDocSelected(key)}
+                          aria-label={`Stop limiting questions to ${key}`}
+                        >
+                          &times;
+                        </button>
+                      </span>
+                    ))}
+                    <button type="button" className="btn-quiet" onClick={() => setSelectedDocs([])}>
+                      Ask all documents
+                    </button>
+                  </>
+                )}
+              </div>
+              <div className="flex items-end gap-3">
+                <textarea
+                  ref={composerRef}
+                  dir="auto"
+                  value={question}
+                  onChange={(e) => setQuestion(e.target.value)}
+                  placeholder={
+                    singleDoc
+                      ? `Ask about ${singleDoc}`
+                      : scoped
+                        ? "Ask about the selected documents"
+                        : "Ask anything about your documents, in any language"
+                  }
+                  rows={2}
+                  aria-label="Your question"
+                  onKeyDown={(e) => {
+                    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+                      e.preventDefault();
+                      e.currentTarget.form?.requestSubmit();
+                    }
+                  }}
+                  className={questionIsRtl ? "rtl-text-ui" : ""}
+                />
+                <button type="submit" disabled={asking || !question.trim() || !hasDocs} className="btn-primary">
+                  {asking ? "Searching…" : "Ask"}
+                </button>
+              </div>
+            </form>
+            <div className="mt-2 flex flex-wrap items-center justify-between gap-3">
+              <p className="rail-note" style={{ color: "var(--ink-dim)" }}>
+                Ctrl + Enter to send{!hasDocs && docs !== null ? " · add a document first" : ""}
+              </p>
+              {thread.length > 0 ? (
+                <span className="flex gap-4">
+                  <button type="button" className="btn-quiet" onClick={exportConversation}>
+                    Export as Markdown
+                  </button>
+                  <button type="button" className="btn-quiet" onClick={clearConversation}>
+                    Clear conversation
+                  </button>
+                </span>
+              ) : null}
+            </div>
+          </div>
+        </div>
+      </main>
 
       {showSyncHelp ? <SyncHelpDialog onClose={() => setShowSyncHelp(false)} /> : null}
-    </main>
+    </div>
   );
 }
 
 function IndexStatusCard({
+  docCount,
   stats,
   error,
   pending,
@@ -608,6 +1298,7 @@ function IndexStatusCard({
   syncing,
   syncNote,
 }: {
+  docCount: number | null;
   stats: IndexStats | null;
   error: boolean;
   pending: number;
@@ -618,109 +1309,88 @@ function IndexStatusCard({
 }) {
   const vectors = stats?.engine?.vectorize?.vectorsCount;
   const hasErrors = (stats?.error ?? 0) > 0;
+  // Files that are in the library but that the index hasn't processed yet.
+  // Before this, the card said "up to date" while a just-uploaded file was
+  // still waiting, which is why it looked like nothing was happening.
+  const handled = (stats?.completed ?? 0) + (stats?.skipped ?? 0) + (stats?.error ?? 0);
+  const waiting = docCount === null || !stats ? 0 : Math.max(0, docCount - handled);
+  const dot = hasErrors ? "#ff8a7a" : pending > 0 || waiting > 0 ? "#ffd166" : "var(--marker)";
 
   return (
-    <div className="paper w-full shrink-0 rounded-xl px-5 py-4 sm:w-72">
-      <div className="flex items-center justify-between">
-        <p className="chip font-medium text-[var(--ink-dim)] uppercase">Index status</p>
+    <div className="status-card" aria-live="polite">
+      <div className="flex items-center justify-between gap-3">
         <div className="flex items-center gap-2">
-          <button
-            type="button"
-            onClick={onSyncNow}
-            disabled={syncing}
-            className="chip text-[var(--accent)] hover:opacity-70 disabled:opacity-50"
-            aria-label="Sync now"
-          >
-            {syncing ? "syncing…" : "sync now"}
+          {error || !stats ? null : <span className="status-dot" style={{ background: dot }} />}
+          <p className="text-sm font-medium">
+            {error
+              ? "Can't reach AI Search"
+              : !stats
+                ? "Checking the index…"
+                : hasErrors
+                  ? `${stats.error} indexing error${stats.error === 1 ? "" : "s"}`
+                  : pending > 0
+                    ? `Indexing, ${pending} pending`
+                    : waiting > 0
+                      ? `${waiting} file${waiting === 1 ? "" : "s"} not indexed yet`
+                      : "Index is up to date"}
+          </p>
+        </div>
+        <div className="flex items-center gap-3">
+          <button type="button" className="rail-link" onClick={onSyncNow} disabled={syncing}>
+            {syncing ? "Syncing…" : "Sync now"}
           </button>
-          <button
-            type="button"
-            onClick={onRefresh}
-            className="chip text-[var(--accent)] hover:opacity-70"
-            aria-label="Refresh index status"
-          >
-            refresh
+          <button type="button" className="rail-link" onClick={onRefresh}>
+            Refresh
           </button>
         </div>
       </div>
 
-      {syncNote ? <p className="fade-in-up mt-2 text-sm text-[var(--ink-dim)]">{syncNote}</p> : null}
-
-      {error ? (
-        <p className="mt-2 text-sm text-[var(--ink-dim)]">Couldn&rsquo;t reach AI Search.</p>
-      ) : !stats ? (
-        <p className="mt-2 text-sm text-[var(--ink-dim)]">checking…</p>
-      ) : (
-        <div className="mt-2 flex items-center gap-2">
-          <span
-            className={`status-dot h-2 w-2 rounded-full ${
-              hasErrors ? "bg-[var(--err)]" : pending > 0 ? "bg-[var(--accent-2)]" : "bg-[var(--accent)]"
-            }`}
-          />
-          <p className="text-sm">
-            {hasErrors
-              ? `${stats.error} indexing error${stats.error === 1 ? "" : "s"}`
-              : pending > 0
-                ? `indexing… ${pending} pending`
-                : "up to date"}
-          </p>
-        </div>
-      )}
+      {syncNote ? <p className="rail-note mt-2">{syncNote}</p> : null}
 
       {stats ? (
-        <dl className="mt-3 grid grid-cols-2 gap-x-3 gap-y-1 border-t border-[var(--border)] pt-3">
-          <dt className="chip text-[var(--ink-dim)]">completed</dt>
-          <dd className="text-right text-sm">{stats.completed ?? 0}</dd>
-          <dt className="chip text-[var(--ink-dim)]">vectors</dt>
-          <dd className="text-right text-sm">{vectors ?? "—"}</dd>
-        </dl>
+        <p className="rail-note mt-2">
+          {stats.completed ?? 0} indexed file{(stats.completed ?? 0) === 1 ? "" : "s"}
+          {vectors !== undefined ? ` · ${vectors.toLocaleString()} searchable passages` : ""}
+        </p>
       ) : null}
     </div>
   );
 }
 
 function SyncHelpDialog({ onClose }: { onClose: () => void }) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
   return (
-    <div
-      className="fixed inset-0 z-20 flex items-center justify-center bg-[var(--ink)]/30 px-6 backdrop-blur-[2px]"
-      onClick={onClose}
-      role="presentation"
-    >
+    <div className="scrim" onClick={onClose} role="presentation">
       <div
-        className="fade-in-up paper w-full max-w-md rounded-xl p-6"
+        className="dialog"
         onClick={(e) => e.stopPropagation()}
         role="dialog"
         aria-modal="true"
         aria-labelledby="sync-help-title"
       >
-        <h3 id="sync-help-title" className="font-[family-name:var(--font-display)] text-lg font-semibold">
-          Newly-added documents aren&rsquo;t searchable instantly
+        <h3 id="sync-help-title" className="font-[family-name:var(--font-display)] text-lg font-bold">
+          New documents aren&rsquo;t searchable right away
         </h3>
-        <p className="mt-2 text-sm leading-relaxed text-[var(--ink-dim)]">
-          This app tries to index new uploads automatically. If an API token is configured
-          (<code className="chip mx-1 rounded bg-[var(--bg-2)] px-1 py-0.5">CF_API_TOKEN</code>),
-          uploads and &ldquo;sync now&rdquo; trigger an indexing job right away. Without one, AI
-          Search still re-syncs on its own schedule (as often as every 15 minutes). To force it
-          immediately yourself, run this from a machine with
-          <code className="chip mx-1 rounded bg-[var(--bg-2)] px-1 py-0.5">wrangler</code>
-          authenticated:
+        <p className="mt-2 text-sm leading-relaxed" style={{ color: "var(--ink-dim)" }}>
+          AI Search re-reads your documents on its own schedule, as often as every 15 minutes, so a new file can take
+          that long to appear in answers. To index immediately, either run this command from a machine where{" "}
+          <code>wrangler</code> is logged in:
         </p>
-        <pre className="chip mt-3 overflow-x-auto rounded-lg bg-[var(--bg-2)] p-3 leading-relaxed">
-          npx wrangler ai-search jobs create cf-rag-tool
-        </pre>
-        <p className="mt-2 text-sm leading-relaxed text-[var(--ink-dim)]">
-          Then watch progress with
-          <code className="chip mx-1 rounded bg-[var(--bg-2)] px-1 py-0.5">
-            npx wrangler ai-search stats cf-rag-tool
-          </code>
-          — or just glance at the Index status panel on this page, which polls the same numbers.
+        <pre className="mt-3">npx wrangler ai-search jobs create cf-rag-tool</pre>
+        <p className="mt-2 text-sm leading-relaxed" style={{ color: "var(--ink-dim)" }}>
+          or set an API token (<code>CF_API_TOKEN</code> with AI Search edit and run access) so uploads and
+          &ldquo;Sync now&rdquo; start the job for you. Watch progress with <code>npx wrangler ai-search stats cf-rag-tool</code>{" "}
+          or the status card in the library panel.
         </p>
-        <button
-          type="button"
-          onClick={onClose}
-          className="mt-4 rounded-lg bg-[var(--accent)] px-4 py-2 text-sm font-medium text-[var(--accent-ink)] hover:opacity-90"
-        >
-          got it
+        <button type="button" onClick={onClose} className="btn-primary mt-4">
+          Got it
         </button>
       </div>
     </div>

@@ -6,9 +6,12 @@ import {
   isAllowedExtension,
   sanitizeFilename,
   titleToKey,
-  MAX_FILE_BYTES,
+  maxBytesFor,
+  formatMiB,
+  extensionOf,
   MAX_PASTE_CHARS,
   ALLOWED_EXTENSIONS,
+  listAllObjects,
 } from "@/lib/docs";
 import { triggerIndexingJob, ensureFastSyncInterval, getPendingRemovals } from "@/lib/aisearch";
 
@@ -45,8 +48,25 @@ export async function POST(request: Request) {
         { status: 400 },
       );
     }
-    if (file.size > MAX_FILE_BYTES) {
-      return Response.json({ error: "File is too large (max 20MB)." }, { status: 413 });
+    // AI Search skips files over its own limit, so refuse them here instead of
+    // storing a file that would never become searchable. A PDF may be larger
+    // only when OCR is on, so look that up for PDFs.
+    let ocrEnabled = false;
+    if (extensionOf(filename) === "pdf") {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const info = (await env.AI_SEARCH.info().catch(() => null)) as any;
+      ocrEnabled = info?.indexing_options?.use_ocr === true;
+    }
+    const limit = maxBytesFor(filename, ocrEnabled);
+    if (file.size > limit) {
+      const hint =
+        extensionOf(filename) === "pdf" && !ocrEnabled
+          ? " Turn on OCR in the library panel to allow PDFs up to 10 MB."
+          : "";
+      return Response.json(
+        { error: `File is too large (max ${formatMiB(limit)} for this file type).${hint}` },
+        { status: 413 },
+      );
     }
     key = sanitizeFilename(filename);
     body = await file.arrayBuffer();
@@ -102,8 +122,8 @@ export async function POST(request: Request) {
  * presenting the R2 listing as "what's indexed."
  */
 export async function GET() {
-  const list = await env.DOCS_BUCKET.list();
-  const docs = list.objects
+  const objects = await listAllObjects(env.DOCS_BUCKET);
+  const docs = objects
     .map((obj) => ({ key: obj.key, size: obj.size, uploaded: obj.uploaded.toISOString() }))
     .sort((a, b) => b.uploaded.localeCompare(a.uploaded));
 

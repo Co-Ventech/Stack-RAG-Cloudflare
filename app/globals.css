@@ -1,43 +1,40 @@
 @import "tailwindcss";
-/* Font-loading tradeoff: this app is language-universal, so in principle
-   every major script family (Arabic, Hebrew, CJK, Devanagari, Thai, …)
-   deserves a dedicated web font. Loading all of those would be a lot of
-   render-blocking weight for the common case of a single script per
-   session. Compromise: we ship one additional family, Noto Naskh Arabic,
-   which covers the RTL scripts most likely to show up next to Latin text
-   in a document-Q&A tool (Arabic, and — because it shares the Arabic
-   block — Urdu, Persian, Pashto, Sindhi, Kurdish). Everything else (CJK,
-   Devanagari, Hebrew, Thai, Cyrillic, etc.) falls back to the reader's own
-   system font stack below, which on any modern OS already ships solid
-   glyph coverage for those scripts — it just won't match this app's
-   chosen display/body typefaces exactly. That's an acceptable tradeoff for
-   a lightweight page over hand-picking and loading a dozen web fonts. */
-@import url("https://fonts.googleapis.com/css2?family=Lora:ital,wght@0,500;0,600;0,700;1,500&family=Work+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&family=Noto+Naskh+Arabic:wght@400;500;600&display=swap");
+/* Fonts: Bricolage Grotesque (display) + Instrument Sans (body). This app is
+   language-universal, so only one extra family is loaded for non-Latin text:
+   Noto Naskh Arabic, which also covers Urdu, Persian, Pashto, Sindhi and
+   Kurdish. Every other script (CJK, Devanagari, Hebrew, Thai, Cyrillic...)
+   falls back to the reader's own system fonts, which already ship solid glyph
+   coverage — an acceptable trade for a light page. */
+@import url("https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Instrument+Sans:wght@400;500;600&family=Noto+Naskh+Arabic:wght@400;500;600&display=swap");
 
 :root {
   color-scheme: light;
-  --bg: #f6f1e7;
-  --bg-2: #efe7d6;
-  --paper: #fffdf8;
-  --ink: #2a2420;
-  --ink-dim: #756a5c;
-  --border: #e4d9c3;
-  --border-strong: #cdbb96;
-  --accent: #3f6b4f;
-  --accent-2: #a8763e;
-  --accent-ink: #f6f1e7;
-  --err: #a23e3e;
-  /* System fallback stacks below include fonts that ship with common OSes
-     for scripts we don't load a web font for (Hebrew, CJK, Devanagari,
-     Thai, Cyrillic, …), so those still render with real script-appropriate
-     glyphs — just via whatever the reader's device already has. */
-  --font-display: "Lora", ui-serif, Georgia, serif;
-  --font-body: "Work Sans", ui-sans-serif, system-ui, sans-serif;
-  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
-  /* Arabic-script text (Arabic, Urdu, Persian, Pashto, Sindhi, Kurdish, …)
-     gets a dedicated web font since it's the RTL script most likely to
-     appear in this app's documents; other RTL scripts (Hebrew, Thaana,
-     Syriac) fall back to the system RTL-capable fonts on the next line. */
+  --bg: #e8edf6;
+  --bg-2: #eef2f9;
+  --sheet: #ffffff;
+  --paper: #ffffff;
+  --ink: #0f1a33;
+  --ink-dim: #5a6683;
+  --border: #d5ddeb;
+  --border-strong: #aebbd3;
+  --accent: #2f46e0;
+  --accent-hover: #2538c4;
+  --accent-ink: #ffffff;
+  /* Highlighter lime: reserved for "this is what the answer is grounded in"
+     (selected documents, citation numbers). Not used for anything else. */
+  --marker: #ddf75a;
+  --marker-ink: #1d2600;
+  --rail: #0e1730;
+  --rail-2: #18244b;
+  --rail-line: #26345f;
+  --rail-ink: #e3e9f9;
+  --rail-dim: #94a1c6;
+  --err: #c2372d;
+  --warn: #8a5a00;
+  --warn-bg: #fff4d6;
+  --font-display: "Bricolage Grotesque", ui-sans-serif, system-ui, sans-serif;
+  --font-body: "Instrument Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
   --font-rtl: "Noto Naskh Arabic", "Geeza Pro", "Al Bayan", "Times New Roman", serif;
 }
 
@@ -45,41 +42,364 @@
   box-sizing: border-box;
 }
 
+html,
 body {
   margin: 0;
   background: var(--bg);
-  background-image:
-    radial-gradient(1px 1px at 20px 30px, rgba(63, 107, 79, 0.06) 1px, transparent 0),
-    radial-gradient(1px 1px at 70px 90px, rgba(63, 107, 79, 0.05) 1px, transparent 0);
-  background-size: 90px 90px;
   color: var(--ink);
   font-family: var(--font-body);
+  font-size: 15px;
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection {
+  background: var(--marker);
+  color: var(--marker-ink);
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.rail :focus-visible {
+  outline-color: var(--marker);
+}
+
+button {
+  font: inherit;
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+/* ---------- Shell ---------- */
+
+.shell {
+  display: grid;
+  grid-template-columns: 1fr;
   min-height: 100vh;
 }
 
-a {
-  color: inherit;
+@media (min-width: 1024px) {
+  .shell {
+    grid-template-columns: 360px minmax(0, 1fr);
+    height: 100vh;
+  }
 }
 
-.paper {
-  background: var(--paper);
-  border: 1px solid var(--border);
-  box-shadow: 0 1px 2px rgba(42, 36, 32, 0.04);
+.rail {
+  background: var(--rail);
+  color: var(--rail-ink);
+  display: flex;
+  flex-direction: column;
+  gap: 1.75rem;
+  padding: 1.5rem 1.25rem 2rem;
+  overflow-y: auto;
+  order: 2;
 }
 
-.chip {
-  font-family: var(--font-mono);
-  font-size: 0.7rem;
+.desk {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow-y: auto;
+  order: 1;
 }
 
-.fade-in-up {
-  animation: fade-in-up 0.35s ease both;
+@media (min-width: 1024px) {
+  .rail {
+    order: 0;
+  }
+  .desk {
+    order: 0;
+  }
 }
 
-@keyframes fade-in-up {
+.desk-inner {
+  width: 100%;
+  max-width: 50rem;
+  margin: 0 auto;
+  padding: 2.5rem 1.5rem 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ---------- Rail ---------- */
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+}
+
+.brand-mark {
+  width: 2.25rem;
+  height: 2.25rem;
+  border-radius: 0.6rem;
+  background: var(--marker);
+  color: var(--marker-ink);
+  display: grid;
+  place-items: center;
+}
+
+.brand-name {
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 1.35rem;
+  letter-spacing: -0.02em;
+}
+
+.rail-heading {
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 1.05rem;
+  letter-spacing: -0.01em;
+}
+
+.rail-note {
+  color: var(--rail-dim);
+  font-size: 0.8rem;
+  line-height: 1.5;
+}
+
+.status-card {
+  background: var(--rail-2);
+  border-radius: 0.9rem;
+  padding: 0.95rem 1rem;
+}
+
+.rail-link {
+  background: none;
+  border: 0;
+  padding: 0;
+  color: var(--rail-dim);
+  font-size: 0.8rem;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  text-decoration-color: var(--rail-line);
+}
+
+.rail-link:hover:not(:disabled) {
+  color: var(--rail-ink);
+}
+
+.rail-link:disabled {
+  opacity: 0.5;
+}
+
+.doc-list {
+  list-style: none;
+  margin: 0.75rem 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.doc-row {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  padding: 0.6rem 0.65rem 0.6rem 0.75rem;
+  border-radius: 0.6rem;
+  background: transparent;
+  transition: background-color 0.15s;
+}
+
+.doc-row:hover {
+  background: var(--rail-2);
+}
+
+.doc-row[data-on="true"] {
+  background: var(--rail-2);
+  box-shadow: inset 3px 0 0 var(--marker);
+}
+
+.doc-check {
+  appearance: none;
+  flex: none;
+  width: 1.1rem;
+  height: 1.1rem;
+  border: 1.5px solid var(--rail-dim);
+  border-radius: 0.3rem;
+  display: grid;
+  place-items: center;
+  background: transparent;
+}
+
+.doc-check:checked {
+  background: var(--marker);
+  border-color: var(--marker);
+}
+
+.doc-check:checked::after {
+  content: "";
+  width: 0.3rem;
+  height: 0.55rem;
+  border: solid var(--marker-ink);
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg) translate(-1px, -1px);
+}
+
+.doc-name {
+  font-weight: 500;
+  font-size: 0.9rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.doc-meta {
+  color: var(--rail-dim);
+  font-size: 0.75rem;
+}
+
+.icon-btn {
+  flex: none;
+  width: 1.9rem;
+  height: 1.9rem;
+  border-radius: 999px;
+  border: 0;
+  background: transparent;
+  color: var(--rail-dim);
+  display: grid;
+  place-items: center;
+}
+
+.icon-btn:hover {
+  background: var(--rail-line);
+  color: #ffb4ab;
+}
+
+.rail-notice {
+  background: var(--warn-bg);
+  color: var(--warn);
+  border-radius: 0.7rem;
+  padding: 0.7rem 0.85rem;
+  font-size: 0.8rem;
+  line-height: 1.5;
+  margin-top: 0.75rem;
+}
+
+.rail-error {
+  background: #3b1620;
+  color: #ffb4ab;
+  border-radius: 0.7rem;
+  padding: 0.6rem 0.85rem;
+  font-size: 0.8rem;
+  margin-top: 0.75rem;
+  display: flex;
+  gap: 0.6rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.seg {
+  display: inline-flex;
+  background: var(--rail-2);
+  border-radius: 999px;
+  padding: 0.2rem;
+  margin-top: 0.75rem;
+}
+
+.seg button {
+  border: 0;
+  background: transparent;
+  color: var(--rail-dim);
+  padding: 0.35rem 0.9rem;
+  border-radius: 999px;
+  font-size: 0.82rem;
+  font-weight: 500;
+}
+
+.seg button[aria-pressed="true"] {
+  background: var(--rail-ink);
+  color: var(--rail);
+}
+
+.dropzone {
+  margin-top: 0.75rem;
+  border: 1.5px dashed var(--rail-line);
+  border-radius: 0.9rem;
+  padding: 1.6rem 1rem;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color 0.15s, background-color 0.15s;
+}
+
+.dropzone:hover,
+.dropzone[data-over="true"] {
+  border-color: var(--marker);
+  background: var(--rail-2);
+}
+
+.field {
+  width: 100%;
+  background: var(--rail-2);
+  color: var(--rail-ink);
+  border: 1px solid var(--rail-line);
+  border-radius: 0.6rem;
+  padding: 0.6rem 0.75rem;
+  font: inherit;
+  font-size: 0.9rem;
+}
+
+.field::placeholder {
+  color: var(--rail-dim);
+}
+
+.btn-marker {
+  border: 0;
+  background: var(--marker);
+  color: var(--marker-ink);
+  font-weight: 600;
+  border-radius: 999px;
+  padding: 0.55rem 1.1rem;
+}
+
+.btn-marker:disabled {
+  opacity: 0.5;
+}
+
+/* ---------- Desk ---------- */
+
+.headline {
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: clamp(2.2rem, 5.6vw, 3.9rem);
+  line-height: 1.02;
+  letter-spacing: -0.035em;
+  min-height: 2.15em;
+  margin: 0;
+}
+
+.headline[dir="rtl"] {
+  font-family: var(--font-rtl);
+  line-height: 1.5;
+  letter-spacing: 0;
+}
+
+.headline-swap {
+  animation: headline-swap 0.55s cubic-bezier(0.2, 0.7, 0.2, 1) both;
+}
+
+@keyframes headline-swap {
   from {
     opacity: 0;
-    transform: translateY(6px);
+    transform: translateY(0.25em);
   }
   to {
     opacity: 1;
@@ -87,27 +407,308 @@ a {
   }
 }
 
-.spin-dot {
-  animation: spin-dot 1s ease-in-out infinite;
+.lede {
+  max-width: 34rem;
+  color: var(--ink-dim);
+  font-size: 1.02rem;
+  line-height: 1.6;
+  margin: 1.1rem 0 0;
 }
 
-@keyframes spin-dot {
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 1.5rem;
+}
+
+.ghost-chip {
+  background: var(--sheet);
+  border: 1px solid var(--border-strong);
+  color: var(--ink);
+  border-radius: 999px;
+  padding: 0.4rem 0.85rem;
+  font-size: 0.85rem;
+  transition: border-color 0.15s, color 0.15s;
+}
+
+.ghost-chip:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.thread {
+  display: flex;
+  flex-direction: column;
+  gap: 2rem;
+  padding-bottom: 2rem;
+}
+
+.question {
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 1.35rem;
+  letter-spacing: -0.02em;
+  line-height: 1.3;
+  padding-inline-start: 0.9rem;
+  border-inline-start: 4px solid var(--accent);
+  margin: 0;
+}
+
+.scope-note {
+  color: var(--ink-dim);
+  font-size: 0.82rem;
+  margin: 0.45rem 0 0;
+  padding-inline-start: 1rem;
+}
+
+.sheet {
+  background: var(--sheet);
+  border: 1px solid var(--border);
+  border-radius: 0.9rem;
+  padding: 1.3rem 1.5rem;
+  margin-top: 0.9rem;
+  box-shadow: 0 14px 30px -22px rgba(15, 26, 51, 0.35);
+}
+
+.sources {
+  margin-top: 1.1rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border);
+}
+
+.sources h3 {
+  font-family: var(--font-display);
+  font-size: 0.95rem;
+  font-weight: 700;
+  margin: 0 0 0.6rem;
+}
+
+.source-row {
+  display: grid;
+  grid-template-columns: 1.6rem minmax(0, 1fr) auto;
+  gap: 0.65rem;
+  align-items: center;
+  padding: 0.35rem 0;
+}
+
+.source-num {
+  width: 1.6rem;
+  height: 1.6rem;
+  border-radius: 0.4rem;
+  background: var(--marker);
+  color: var(--marker-ink);
+  font-weight: 700;
+  font-size: 0.8rem;
+  display: grid;
+  place-items: center;
+}
+
+.source-row[data-removed="true"] .source-num {
+  background: #fbdcd8;
+  color: var(--err);
+}
+
+.meter {
+  height: 4px;
+  border-radius: 999px;
+  background: var(--border);
+  overflow: hidden;
+  margin-top: 0.3rem;
+}
+
+.meter > span {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  border-radius: 999px;
+}
+
+.composer-wrap {
+  position: sticky;
+  bottom: 0;
+  padding: 1.25rem 0 1.5rem;
+  background: linear-gradient(to top, var(--bg) 72%, rgba(232, 237, 246, 0));
+}
+
+.composer {
+  background: var(--sheet);
+  border: 1.5px solid var(--border-strong);
+  border-radius: 1.15rem;
+  padding: 0.8rem 0.9rem 0.8rem 1.1rem;
+  box-shadow: 0 18px 36px -24px rgba(15, 26, 51, 0.45);
+  transition: border-color 0.15s;
+}
+
+.composer:focus-within {
+  border-color: var(--accent);
+}
+
+.composer textarea {
+  width: 100%;
+  border: 0;
+  outline: 0;
+  resize: none;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  font-size: 1.02rem;
+  line-height: 1.5;
+}
+
+.composer textarea::placeholder {
+  color: var(--ink-dim);
+}
+
+.marker-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  max-width: 15rem;
+  background: var(--marker);
+  color: var(--marker-ink);
+  border-radius: 999px;
+  padding: 0.2rem 0.3rem 0.2rem 0.7rem;
+  font-size: 0.8rem;
+  font-weight: 500;
+}
+
+.marker-chip button {
+  border: 0;
+  background: rgba(29, 38, 0, 0.12);
+  color: inherit;
+  width: 1.15rem;
+  height: 1.15rem;
+  border-radius: 999px;
+  line-height: 1;
+}
+
+.btn-primary {
+  border: 0;
+  background: var(--accent);
+  color: var(--accent-ink);
+  font-weight: 600;
+  border-radius: 0.8rem;
+  padding: 0.6rem 1.25rem;
+  transition: background-color 0.15s;
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+.btn-primary:disabled {
+  background: var(--border-strong);
+}
+
+.btn-quiet {
+  border: 0;
+  background: none;
+  color: var(--ink-dim);
+  font-size: 0.85rem;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.btn-quiet:hover {
+  color: var(--ink);
+}
+
+.error-text {
+  color: var(--err);
+  font-size: 0.9rem;
+  margin: 0.4rem 0 0;
+}
+
+.dots span {
+  display: inline-block;
+  width: 0.4rem;
+  height: 0.4rem;
+  margin-inline-end: 0.25rem;
+  border-radius: 999px;
+  background: var(--accent);
+  animation: dot-bounce 1s ease-in-out infinite;
+}
+
+.dots span:nth-child(2) {
+  animation-delay: 0.15s;
+}
+.dots span:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+@keyframes dot-bounce {
+  0%,
+  80%,
+  100% {
+    opacity: 0.25;
+    transform: translateY(0);
+  }
+  40% {
+    opacity: 1;
+    transform: translateY(-0.2rem);
+  }
+}
+
+.status-dot {
+  width: 0.55rem;
+  height: 0.55rem;
+  border-radius: 999px;
+  flex: none;
+  animation: status-pulse 1.8s ease-in-out infinite;
+}
+
+@keyframes status-pulse {
   0%,
   100% {
-    opacity: 0.2;
+    box-shadow: 0 0 0 0 rgba(221, 247, 90, 0.5);
   }
   50% {
-    opacity: 1;
+    box-shadow: 0 0 0 5px rgba(221, 247, 90, 0);
   }
 }
 
-/* RTL script text (Arabic, Urdu, Persian, Hebrew, …): script-appropriate
-   font and roomier line-height — Arabic-script diagonal stress in
-   particular needs more vertical breathing room than Latin text does.
-   Applied via dir="auto" + this class so mixed-script content still
-   renders each script correctly. rtl-text is for larger/quoted passages
-   (answers, source excerpts); rtl-text-ui is for compact UI-sized text
-   (inputs, chips) where the extra line-height would look cramped/uneven. */
+@media (prefers-reduced-motion: reduce) {
+  .headline-swap,
+  .dots span,
+  .status-dot {
+    animation: none;
+  }
+}
+
+/* Dialog */
+
+.scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  padding: 1.5rem;
+  background: rgba(14, 23, 48, 0.55);
+}
+
+.dialog {
+  background: var(--sheet);
+  border-radius: 1rem;
+  padding: 1.5rem;
+  max-width: 28rem;
+  width: 100%;
+  box-shadow: 0 30px 60px -20px rgba(14, 23, 48, 0.6);
+}
+
+.dialog pre {
+  background: var(--bg-2);
+  border-radius: 0.6rem;
+  padding: 0.7rem 0.9rem;
+  overflow-x: auto;
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+}
+
+/* RTL script text (Arabic, Urdu, Persian, Hebrew...): script-appropriate font
+   and roomier line-height. Applied with dir="auto" so mixed-script content
+   still renders each script correctly. */
 .rtl-text {
   font-family: var(--font-rtl);
   line-height: 2.1;
@@ -122,29 +723,10 @@ a {
   text-align: right;
 }
 
-.status-dot {
-  animation: status-pulse 1.6s ease-in-out infinite;
-}
+/* ---------- Rendered Markdown for answers ---------- */
 
-@keyframes status-pulse {
-  0%,
-  100% {
-    box-shadow: 0 0 0 0 rgba(63, 107, 79, 0.35);
-  }
-  50% {
-    box-shadow: 0 0 0 4px rgba(63, 107, 79, 0);
-  }
-}
-
-::selection {
-  background: rgba(63, 107, 79, 0.18);
-}
-
-/* Rendered Markdown for answer bodies. The model's replies routinely
-   include bold, lists, and GFM pipe tables, so this styles the output of
-   react-markdown + remark-gfm rather than leaving it as an unstyled blob. */
 .markdown-body {
-  font-size: 0.875rem;
+  font-size: 1rem;
   line-height: 1.7;
 }
 
@@ -160,7 +742,7 @@ a {
 .markdown-body ul,
 .markdown-body ol,
 .markdown-body blockquote {
-  margin: 0.6em 0;
+  margin: 0.65em 0;
 }
 
 .markdown-body ul,
@@ -177,37 +759,37 @@ a {
 .markdown-body h3,
 .markdown-body h4 {
   font-family: var(--font-display);
-  font-weight: 600;
-  line-height: 1.3;
-  margin: 0.9em 0 0.4em;
+  font-weight: 700;
+  line-height: 1.25;
+  margin: 1em 0 0.4em;
 }
 
 .markdown-body h1 {
-  font-size: 1.25em;
+  font-size: 1.3em;
 }
 .markdown-body h2 {
-  font-size: 1.15em;
+  font-size: 1.18em;
 }
 .markdown-body h3,
 .markdown-body h4 {
-  font-size: 1.05em;
+  font-size: 1.06em;
 }
 
 .markdown-body strong {
-  font-weight: 700;
+  font-weight: 600;
 }
 
 .markdown-body code {
   font-family: var(--font-mono);
   font-size: 0.85em;
   background: var(--bg-2);
-  border-radius: 0.25em;
+  border-radius: 0.3em;
   padding: 0.1em 0.35em;
 }
 
 .markdown-body pre {
   background: var(--bg-2);
-  border-radius: 0.5em;
+  border-radius: 0.6em;
   padding: 0.75em 1em;
   overflow-x: auto;
 }
@@ -218,23 +800,20 @@ a {
 }
 
 .markdown-body blockquote {
-  border-inline-start: 3px solid var(--border-strong);
+  border-inline-start: 3px solid var(--marker);
   padding-inline-start: 0.9em;
   color: var(--ink-dim);
 }
 
 .markdown-body a {
-  text-decoration: underline;
-  text-decoration-color: var(--border-strong);
+  color: var(--accent);
   text-underline-offset: 2px;
 }
 
-/* Tables: wrapped in an overflow-x:auto scroller so a wide table (or one
-   in a language that renders wider, e.g. tall Arabic-script ligatures)
-   scrolls inside the card instead of breaking the page's own layout. */
+/* Tables scroll inside the sheet instead of breaking the page layout. */
 .markdown-table-wrap {
   overflow-x: auto;
-  margin: 0.6em 0;
+  margin: 0.7em 0;
 }
 
 .markdown-body table {
@@ -245,8 +824,8 @@ a {
 
 .markdown-body th,
 .markdown-body td {
-  border: 1px solid var(--border-strong);
-  padding: 0.4em 0.7em;
+  border: 1px solid var(--border);
+  padding: 0.45em 0.75em;
   text-align: inherit;
   vertical-align: top;
 }
@@ -254,4 +833,242 @@ a {
 .markdown-body th {
   background: var(--bg-2);
   font-weight: 600;
+}
+
+/* ---------- Chat-with-a-document additions ---------- */
+
+.doc-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.1rem;
+  background: none;
+  border: 0;
+  padding: 0;
+  text-align: start;
+  color: inherit;
+}
+
+.doc-main:hover .doc-name {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  text-decoration-color: var(--marker);
+}
+
+.doc-main .doc-name {
+  max-width: 100%;
+}
+
+a.icon-btn {
+  text-decoration: none;
+}
+
+.icon-btn:hover {
+  color: var(--rail-ink);
+}
+
+.icon-btn.danger:hover {
+  color: #ffb4ab;
+}
+
+.rail :focus-visible,
+.rail a:focus-visible {
+  outline: 2px solid var(--marker);
+  outline-offset: 2px;
+}
+
+.scope-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  background: var(--marker);
+  color: var(--marker-ink);
+  border-radius: 0.9rem;
+  padding: 0.75rem 1rem;
+  margin-bottom: 1.5rem;
+}
+
+.scope-bar-title {
+  margin: 0;
+  font-size: 0.95rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.scope-bar-note {
+  margin: 0.1rem 0 0;
+  font-size: 0.82rem;
+  opacity: 0.8;
+}
+
+.scope-bar .btn-quiet {
+  color: var(--marker-ink);
+}
+
+.loading-sheet {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.loading-sheet .dots {
+  margin: 0;
+}
+
+.error-box {
+  margin-top: 0.9rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+  background: #fdeceb;
+  border: 1px solid #f3c4c0;
+  color: var(--err);
+  border-radius: 0.9rem;
+  padding: 0.85rem 1.1rem;
+}
+
+.error-box p {
+  margin: 0;
+  font-size: 0.95rem;
+  flex: 1;
+  min-width: 14rem;
+}
+
+.btn-outline-ink {
+  background: var(--sheet);
+  border: 1.5px solid var(--err);
+  color: var(--err);
+  border-radius: 0.7rem;
+  padding: 0.4rem 1rem;
+  font-weight: 600;
+}
+
+.btn-outline-ink:hover {
+  background: var(--err);
+  color: #fff;
+}
+
+.answer-actions {
+  display: flex;
+  gap: 1.1rem;
+  margin: 0.5rem 0 0 0.25rem;
+}
+
+.btn-quiet:disabled {
+  opacity: 0.5;
+  text-decoration: none;
+}
+
+.source-row {
+  grid-template-columns: 1.6rem minmax(0, 1fr) auto;
+}
+
+.source-extra {
+  grid-column: 2 / -1;
+}
+
+.passage {
+  margin: 0.45rem 0 0.2rem;
+  padding: 0.6rem 0.8rem;
+  border-inline-start: 3px solid var(--marker);
+  background: var(--bg-2);
+  border-radius: 0 0.5rem 0.5rem 0;
+  font-size: 0.9rem;
+  line-height: 1.6;
+  color: var(--ink);
+}
+
+.src-link {
+  color: var(--ink);
+  text-underline-offset: 3px;
+  text-decoration-color: var(--border-strong);
+}
+
+.src-link:hover {
+  text-decoration-color: var(--accent);
+  color: var(--accent);
+}
+
+.composer textarea:disabled {
+  opacity: 0.6;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .doc-row {
+    transition: none;
+  }
+}
+
+/* ---------- OCR switch ---------- */
+
+.switch-row {
+  display: flex;
+  gap: 0.8rem;
+  align-items: flex-start;
+  margin-top: 0.75rem;
+  font-size: 0.9rem;
+  line-height: 1.4;
+  cursor: pointer;
+}
+
+.switch {
+  appearance: none;
+  flex: none;
+  position: relative;
+  width: 2.4rem;
+  height: 1.4rem;
+  border-radius: 999px;
+  background: var(--rail-line);
+  margin-top: 0.1rem;
+  transition: background-color 0.2s;
+}
+
+.switch::after {
+  content: "";
+  position: absolute;
+  top: 0.15rem;
+  left: 0.15rem;
+  width: 1.1rem;
+  height: 1.1rem;
+  border-radius: 999px;
+  background: var(--rail-ink);
+  transition: transform 0.2s;
+}
+
+.switch:checked {
+  background: var(--marker);
+}
+
+.switch:checked::after {
+  transform: translateX(1rem);
+  background: var(--marker-ink);
+}
+
+.switch:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .switch,
+  .switch::after {
+    transition: none;
+  }
+}
+
+.no-sources {
+  margin: 1rem 0 0;
+  padding: 0.7rem 0.9rem;
+  border-radius: 0.6rem;
+  background: var(--warn-bg);
+  color: var(--warn);
+  font-size: 0.88rem;
+  line-height: 1.5;
 }

@@ -1,10 +1,18 @@
 export const CHAT_MODEL = "@cf/openai/gpt-oss-20b";
-export const MAX_FILE_BYTES = 20 * 1024 * 1024; // 20 MB
+// Cloudflare AI Search's own per-file limits (it silently skips anything larger,
+// so the app must refuse it up front instead of accepting it and never
+// indexing it): 10 MiB for plain text and for PDFs when OCR is on; 4 MiB for
+// PDFs without OCR and for every other converted format (Word, ODT, images).
+export const MIB = 1024 * 1024;
+export const MAX_FILE_BYTES = 10 * MIB; // the largest any file can be
+export const MAX_CONVERTED_BYTES = 4 * MIB;
 export const MAX_PASTE_CHARS = 200_000;
+export const MAX_QUESTION_CHARS = 2_000;
 
 // Extensions AI Search can index from an R2 source: plain text/markdown
 // directly, PDFs natively, and .docx/.odt via its own text conversion.
-export const ALLOWED_EXTENSIONS = ["txt", "md", "pdf", "docx", "odt"];
+export const IMAGE_EXTENSIONS = ["jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff", "heic", "heif"];
+export const ALLOWED_EXTENSIONS = ["txt", "md", "pdf", "docx", "odt", ...IMAGE_EXTENSIONS];
 
 export function extensionOf(filename: string): string {
   const dot = filename.lastIndexOf(".");
@@ -13,6 +21,24 @@ export function extensionOf(filename: string): string {
 
 export function isAllowedExtension(filename: string): boolean {
   return ALLOWED_EXTENSIONS.includes(extensionOf(filename));
+}
+
+export function isImageFile(filename: string): boolean {
+  return IMAGE_EXTENSIONS.includes(extensionOf(filename));
+}
+
+/** The largest size AI Search will index for this kind of file. A PDF may be
+ * 10 MiB only when OCR is enabled; plain text is 10 MiB either way; Word,
+ * ODT and images are 4 MiB. */
+export function maxBytesFor(filename: string, ocrEnabled: boolean): number {
+  const ext = extensionOf(filename);
+  if (ext === "txt" || ext === "md") return MAX_FILE_BYTES;
+  if (ext === "pdf") return ocrEnabled ? MAX_FILE_BYTES : MAX_CONVERTED_BYTES;
+  return MAX_CONVERTED_BYTES;
+}
+
+export function formatMiB(bytes: number): string {
+  return `${Math.round((bytes / MIB) * 10) / 10} MB`;
 }
 
 /** R2 object keys are flat filenames — strip path separators and anything
@@ -95,12 +121,24 @@ export function buildFilenameFilter(filenames: string[]): AiSearchFilenameFilter
 export interface RawSource {
   key: string;
   score?: number;
+  /** The retrieved passage text, when the search returned it. */
+  text?: string;
 }
 
 export interface DedupedSource {
   key: string;
   score?: number;
   count: number;
+  /** Best-scoring passage for this file (trimmed), shown as evidence. */
+  excerpt?: string;
+}
+
+export const MAX_EXCERPT_CHARS = 420;
+
+function toExcerpt(text: string | undefined): string | undefined {
+  const t = text?.replace(/\s+/g, " ").trim();
+  if (!t) return undefined;
+  return t.length > MAX_EXCERPT_CHARS ? `${t.slice(0, MAX_EXCERPT_CHARS).trimEnd()}…` : t;
 }
 
 /**
@@ -114,12 +152,16 @@ export function dedupeSources(sources: RawSource[]): DedupedSource[] {
   for (const s of sources) {
     const existing = byKey.get(s.key);
     if (!existing) {
-      byKey.set(s.key, { key: s.key, score: s.score, count: 1 });
+      byKey.set(s.key, { key: s.key, score: s.score, count: 1, excerpt: toExcerpt(s.text) });
       continue;
     }
     existing.count += 1;
     if (s.score !== undefined && (existing.score === undefined || s.score > existing.score)) {
       existing.score = s.score;
+      // The excerpt follows the best-scoring chunk.
+      existing.excerpt = toExcerpt(s.text) ?? existing.excerpt;
+    } else if (existing.excerpt === undefined) {
+      existing.excerpt = toExcerpt(s.text);
     }
   }
   return [...byKey.values()].sort((a, b) => {
@@ -128,4 +170,125 @@ export function dedupeSources(sources: RawSource[]): DedupedSource[] {
     if (b.score === undefined) return -1;
     return b.score - a.score;
   });
+}
+
+// --- Full bucket listing ---
+//
+// R2's list() returns at most 1000 objects per call. Using a single call
+// silently drops everything past the first page — which would hide
+// documents from the library and make citations to them look "removed".
+// This follows the cursor until the listing is complete (bounded so a
+// misbehaving bucket can never loop forever).
+
+export interface ListedObject {
+  key: string;
+  size: number;
+  uploaded: Date;
+}
+
+export interface BucketListPage {
+  objects: ListedObject[];
+  truncated: boolean;
+  cursor?: string;
+}
+
+export interface ListableBucket {
+  list(options?: { cursor?: string; limit?: number }): Promise<BucketListPage>;
+}
+
+export const MAX_LIST_PAGES = 20;
+
+export async function listAllObjects(bucket: ListableBucket): Promise<ListedObject[]> {
+  const all: ListedObject[] = [];
+  let cursor: string | undefined;
+  for (let page = 0; page < MAX_LIST_PAGES; page++) {
+    const result = await bucket.list(cursor ? { cursor } : undefined);
+    all.push(...result.objects);
+    if (!result.truncated || !result.cursor) break;
+    cursor = result.cursor;
+  }
+  return all;
+}
+
+// --- Conversation history ("follow-up questions") ---
+
+export const MAX_HISTORY_MESSAGES = 12;
+export const MAX_HISTORY_MESSAGE_CHARS = 4_000;
+
+export interface HistoryMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+
+/** Validates the earlier turns sent by the client. Anything malformed is
+ * dropped, each message is capped, and only the most recent
+ * MAX_HISTORY_MESSAGES are kept — the request body is never trusted as-is. */
+export function sanitizeHistory(raw: unknown): HistoryMessage[] {
+  if (!Array.isArray(raw)) return [];
+  const clean: HistoryMessage[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const { role, content } = item as { role?: unknown; content?: unknown };
+    if (role !== "user" && role !== "assistant") continue;
+    if (typeof content !== "string") continue;
+    const text = content.trim().slice(0, MAX_HISTORY_MESSAGE_CHARS);
+    if (!text) continue;
+    clean.push({ role, content: text });
+  }
+  return clean.slice(-MAX_HISTORY_MESSAGES);
+}
+
+// --- Search error classification ---
+
+function errorText(err: unknown): string {
+  if (err instanceof Error) return `${err.name} ${err.message}`;
+  return String(err ?? "");
+}
+
+/** True when AI Search (or the remote proxy in front of it) timed out. */
+export function isSearchTimeout(err: unknown): boolean {
+  return /time[d ]?-?out|timed out/i.test(errorText(err));
+}
+
+/** True for transient failures worth one quick retry (a timeout is excluded
+ * on purpose by the caller: a retry would double an already long wait). */
+export function isRetryableSearchError(err: unknown): boolean {
+  return /\b(5\d\d|temporar|unavailable|overload|rate.?limit|try again|connection|ECONNRESET|fetch failed)\b/i.test(
+    errorText(err),
+  );
+}
+
+// --- Serving stored documents safely ---
+
+/** Content type is chosen from the extension — never from the uploader's
+ * claimed type — so an uploaded file can't be served as HTML. Only plain
+ * text and PDF open inline; everything else downloads. */
+export function contentTypeForKey(key: string): { type: string; inline: boolean } {
+  switch (extensionOf(key)) {
+    case "txt":
+    case "md":
+      return { type: "text/plain; charset=utf-8", inline: true };
+    case "pdf":
+      return { type: "application/pdf", inline: true };
+    case "docx":
+      return {
+        type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        inline: false,
+      };
+    case "odt":
+      return { type: "application/vnd.oasis.opendocument.text", inline: false };
+    case "jpg":
+    case "jpeg":
+      return { type: "image/jpeg", inline: true };
+    case "png":
+      return { type: "image/png", inline: true };
+    case "webp":
+      return { type: "image/webp", inline: true };
+    case "gif":
+      return { type: "image/gif", inline: true };
+    case "bmp":
+      return { type: "image/bmp", inline: true };
+    default:
+      return { type: "application/octet-stream", inline: false };
+  }
 }
